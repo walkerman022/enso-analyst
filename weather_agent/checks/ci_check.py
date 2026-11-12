@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        total, passed, failed, _ = run_checks(args.timeout)
+        total, passed, failed, output = run_checks(args.timeout)
     except Exception as exc:
         print(f"[CI] 执行失败：{type(exc).__name__}: {exc}")
         return 2
