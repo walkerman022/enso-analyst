@@ -1,5 +1,7 @@
 # enso-analyst
 
+![CI](https://github.com/walkerman022/enso-analyst/actions/workflows/weather-agent.yml/badge.svg)
+
 A tool-augmented LLM agent for ENSO monitoring, analysis and forecasting.
 
 The agent answers questions such as *"is this an El Niño year?"*, *"how is ONI defined?"* or
