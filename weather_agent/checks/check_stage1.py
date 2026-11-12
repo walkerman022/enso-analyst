@@ -231,6 +231,10 @@ def case_plots() -> None:
     from weather_agent.tools import plot_enso_regions, plot_enso_trend
 
     trend = plot_enso_trend(12)
+    if isinstance(trend, str):
+        # 没装 matplotlib 时会返回错误串；给出明确失败，而不是 TypeError
+        check("绘图工具可用（缺少 matplotlib？）", False, trend[:60])
+        return
     path = Path(trend["file_path"])
     check("趋势图已落盘", path.exists() and path.stat().st_size > 5000, f"{path.name} {path.stat().st_size if path.exists() else 0}B")
     check("趋势图返回季节数正确", trend["seasons_plotted"] == 12, str(trend["seasons_plotted"]))
