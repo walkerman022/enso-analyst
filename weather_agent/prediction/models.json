@@ -1,0 +1,21 @@
+{
+  "python": "D:/1_ENSO_prediction/env/dy_enso/python.exe",
+  "repo": "D:/1_ENSO_prediction/code/PhyDNet-master",
+  "dataset": "multivariate_anomaly_zscore_1958_2012.nc",
+  "dataset_start": "1958-01",
+  "input_frames": 12,
+  "default_model": "phydnet_lead12_v17",
+  "models": {
+    "phydnet_lead12_v17": {
+      "checkpoint": "save/encoder_v17.31_phydnet_enso_lead12_deriv20_best.pth",
+      "lead": 12,
+      "note": "lead12 + deriv20；权重不含 wind 交叉注意力（推理时该分支关闭）"
+    },
+    "phydnet_lead6_v9": {
+      "checkpoint": "save/encoder_v9.5_phydnet_enso_lead6_best.pth",
+      "lead": 6,
+      "note": "lead6；较早一版实验权重"
+    }
+  },
+  "data_through": "2026-02"
+}

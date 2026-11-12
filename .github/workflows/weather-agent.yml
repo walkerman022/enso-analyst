@@ -1,0 +1,23 @@
+name: weather-agent-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # 离线断言不调用模型，这里只需要让 credentials 校验通过
+      DEEPSEEK_API_KEY: dummy
+      DEEPSEEK_BASE_URL: https://api.deepseek.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run weather_agent checks
+        run: python weather_agent/checks/ci_check.py

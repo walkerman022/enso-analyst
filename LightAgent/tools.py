@@ -1,0 +1,370 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+作者: [weego/WXAI-Team]
+最后更新: 2026-02-20
+"""
+
+import json
+import importlib
+import importlib.util
+import inspect
+import os
+import re
+import traceback
+import warnings
+from copy import deepcopy
+from typing import List, Dict, Any, Callable, Union, Generator, AsyncGenerator
+
+from .errors import format_error_code, format_lightagent_error
+from .builtin_tools.python_executor import UNSAFE_PYTHON_TOOL_REASON, is_unsafe_python_tool
+
+
+_TOOL_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SUPPORTED_TOOL_PARAM_TYPES = {"string", "integer", "number", "boolean", "array", "object"}
+
+
+class ToolRegistry:
+    """集中管理工具注册表，避免全局变量"""
+
+    def __init__(self):
+        self.function_mappings = {}  # 工具名称 -> 工具函数对象
+        self.function_info = {}  # 工具名称 -> 工具info信息，检验参数查描述
+        self.openai_function_schemas = []  # OpenAI 格式的工具描述，发给模型
+        self._registration_counts: Dict[str, int] = {}  # 工具名称 -> 注册次数，查重
+
+    def register_tool(self, func: Callable) -> bool:
+        """注册单个工具"""
+        if not hasattr(func, "tool_info"):
+            return False
+
+        tool_info = func.tool_info
+        tool_name = tool_info["tool_name"]
+        existing_func = self.function_mappings.get(tool_name)
+        if tool_name not in self._registration_counts:
+            self._registration_counts[tool_name] = 1
+        elif existing_func is not func:
+            self._registration_counts[tool_name] += 1
+            # 同名不同实现以前是静默覆盖，排查问题时看不出是哪个工具生效
+            warnings.warn(
+                f"tool `{tool_name}` is being overridden by a different function; "
+                "the previous implementation is silently replaced",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # 注册到字典
+        self.function_info[tool_name] = tool_info
+        self.function_mappings[tool_name] = func
+
+        # 构建 OpenAI 格式的工具描述
+        tool_params_openai = {}
+        tool_required = []
+        for param in tool_info["tool_params"]:
+            param_def = {k: v for k, v in param.items() if k not in ("name", "required")}
+            tool_params_openai[param["name"]] = param_def
+            if param.get("required", False):
+                tool_required.append(param["name"])
+
+        tool_def_openai = {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": tool_info["tool_description"],
+                "parameters": {
+                    "type": "object",
+                    "properties": tool_params_openai,
+                    "required": tool_required,
+                },
+            }
+        }
+
+        self.openai_function_schemas = [
+            schema for schema in self.openai_function_schemas
+            if schema.get("function", {}).get("name") != tool_name
+        ]
+        self.openai_function_schemas.append(tool_def_openai)
+        return True
+
+    def register_tools(self, tools: List[Callable]) -> bool:
+        """批量注册工具"""
+        success = True
+        for func in tools:
+            if not self.register_tool(func):
+                success = False
+        return success
+
+    @staticmethod
+    def validate_tool_info(tool_info: Any) -> List[Dict[str, str]]:
+        """Return structured diagnostics for one ``tool_info`` definition."""
+        diagnostics: List[Dict[str, str]] = []
+
+        if not isinstance(tool_info, dict):
+            return [{
+                "tool": "<unknown>",
+                "level": "error",
+                "field": "tool_info",
+                "message": "tool_info must be a dictionary",
+            }]
+
+        raw_tool_name = tool_info.get("tool_name")
+        tool_name = raw_tool_name if isinstance(raw_tool_name, str) and raw_tool_name else "<unknown>"
+
+        def add(level: str, field: str, message: str) -> None:
+            diagnostics.append({
+                "tool": tool_name,
+                "level": level,
+                "field": field,
+                "message": message,
+            })
+
+        if not isinstance(raw_tool_name, str) or not raw_tool_name.strip():
+            add("error", "tool_name", "tool_name must be a non-empty string")
+        elif not _TOOL_NAME_PATTERN.fullmatch(raw_tool_name):
+            add("error", "tool_name", "tool_name must match [A-Za-z_][A-Za-z0-9_]*")
+
+        description = tool_info.get("tool_description")
+        if not isinstance(description, str) or not description.strip():
+            add("warning", "tool_description", "tool_description should not be empty")
+
+        params = tool_info.get("tool_params")
+        if not isinstance(params, list):
+            add("error", "tool_params", "tool_params must be a list")
+            return diagnostics
+
+        param_names: set[str] = set()
+        for index, param in enumerate(params):
+            field_prefix = f"tool_params[{index}]"
+            if not isinstance(param, dict):
+                add("error", field_prefix, "tool parameter must be a dictionary")
+                continue
+
+            param_name = param.get("name")
+            if not isinstance(param_name, str) or not param_name.strip():
+                add("error", f"{field_prefix}.name", "parameter name must be a non-empty string")
+            elif param_name in param_names:
+                add("error", f"{field_prefix}.name", f"duplicate parameter name `{param_name}`")
+            else:
+                param_names.add(param_name)
+
+            param_type = param.get("type")
+            if not isinstance(param_type, str) or param_type not in _SUPPORTED_TOOL_PARAM_TYPES:
+                supported = ", ".join(sorted(_SUPPORTED_TOOL_PARAM_TYPES))
+                add("error", f"{field_prefix}.type", f"parameter type must be one of: {supported}")
+
+            param_description = param.get("description")
+            if not isinstance(param_description, str) or not param_description.strip():
+                add("warning", f"{field_prefix}.description", "parameter description should not be empty")
+
+            if "required" in param and not isinstance(param["required"], bool):
+                add("error", f"{field_prefix}.required", "required must be a boolean")
+
+        return diagnostics
+
+    def validate_tools(self) -> List[Dict[str, str]]:
+        """Validate all registered tools without changing registration behavior."""
+        diagnostics: List[Dict[str, str]] = []
+        for tool_name, tool_info in self.function_info.items():
+            diagnostics.extend(self.validate_tool_info(tool_info))
+            count = self._registration_counts.get(tool_name, 0)
+            if count > 1:
+                diagnostics.append({
+                    "tool": tool_name,
+                    "level": "error",
+                    "field": "tool_name",
+                    "message": f"tool name `{tool_name}` was registered {count} times",
+                })
+        return diagnostics
+
+    def get_tools(self) -> List[Dict[str, Any]]:
+        """获取所有工具的描述（OpenAI 格式）"""
+        return deepcopy(self.openai_function_schemas)
+
+    def get_tools_str(self) -> str:
+        """将工具描述转换为格式化的 JSON 字符串"""
+        return json.dumps(self.openai_function_schemas, indent=4, ensure_ascii=False)
+
+    def filter_tools(self, tool_reflection_result: str) -> List[Dict]:
+        """根据内容过滤工具"""
+        try:
+            # 安全解析可能包含 Markdown 代码块的 JSON
+            refined_content = tool_reflection_result.strip()
+            if refined_content.startswith('```json') and refined_content.endswith('```'):
+                refined_content = refined_content[7:-3].strip()
+
+            parsed_data = json.loads(refined_content)
+            valid_tools = {tool["name"].strip().lower() for tool in parsed_data.get("tools", [])}
+
+            return [
+                schema for schema in self.openai_function_schemas
+                if isinstance(schema, dict) and
+                   schema.get("function", {}).get("name", "").strip().lower() in valid_tools
+            ]
+        except (json.JSONDecodeError, KeyError, AttributeError) as e:
+            raise ValueError(f"工具过滤失败: {str(e)}") from e
+
+
+class ToolLoader:
+    """工具加载器，支持动态加载和缓存"""
+
+    def __init__(self, tools_directory: str = "tools"):
+        self.tools_directory = tools_directory
+        self.loaded_tools = {}
+
+    def load_tool(self, tool_name: str) -> Callable:
+        """加载单个工具"""
+        if not self._is_safe_tool_name(tool_name):
+            raise ValueError(f"Invalid tool name: {tool_name}")
+
+        if tool_name in self.loaded_tools:
+            return self.loaded_tools[tool_name]
+
+        tools_directory = os.path.abspath(self.tools_directory)
+        tool_path = os.path.abspath(os.path.join(tools_directory, f"{tool_name}.py"))
+        if not tool_path.startswith(tools_directory + os.sep):
+            raise ValueError(f"Tool path escapes tools directory: {tool_name}")
+        if not os.path.exists(tool_path):
+            raise FileNotFoundError(f"Tool '{tool_name}' not found in {tool_path}")
+
+        # 动态加载模块
+        spec = importlib.util.spec_from_file_location(tool_name, tool_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        # 获取工具函数
+        if hasattr(module, tool_name):
+            tool_func = getattr(module, tool_name)
+            if callable(tool_func) and hasattr(tool_func, "tool_info"):
+                self.loaded_tools[tool_name] = tool_func
+                return tool_func
+
+        raise AttributeError(f"Tool '{tool_name}' is not properly defined in {tool_path}")
+
+    @staticmethod
+    def _is_safe_tool_name(tool_name: str) -> bool:
+        return bool(_TOOL_NAME_PATTERN.fullmatch(str(tool_name)))
+
+    def load_tools(self, tool_names: List[str]) -> Dict[str, Callable]:
+        """批量加载工具"""
+        for tool_name in tool_names:
+            if tool_name not in self.loaded_tools:
+                self.load_tool(tool_name)
+        return self.loaded_tools
+
+
+class AsyncToolDispatcher:
+    """异步工具调度器"""
+
+    def __init__(self, function_mappings: Dict[str, Callable] = None, function_info: Dict[str, Dict[str, Any]] = None):
+        self.function_mappings = function_mappings or {}
+        self.function_info = function_info or {}
+
+    async def dispatch(self, tool_name: str, tool_params: Dict[str, Any]) -> Union[
+        str, Generator[str, None, None]]:
+        """调用工具执行，支持同步/异步工具及流式输出。
+        异步生成器工具的结果在 dispatch 内收集并序列化为 str 返回；
+        同步生成器工具透传 Generator，由调用方消费以支持流式输出。
+        """
+        # 工具存在吗
+        if tool_name not in self.function_mappings:
+            return format_error_code("LA-TOOL", f"Tool `{tool_name}` not found.")
+        # 工具安全么
+        tool_call = self.function_mappings[tool_name]
+        if is_unsafe_python_tool(tool_name, tool_call):
+            return format_error_code("LA-SANDBOX", UNSAFE_PYTHON_TOOL_REASON)
+        # 参数校验
+        validation_error = self._validate_tool_params(tool_name, tool_params)
+        if validation_error:
+            return validation_error
+        # 执行异常
+        try:
+            # 处理不同类型的工具
+            if inspect.iscoroutinefunction(tool_call):
+                # 异步函数 - 直接 await 获取结果
+                result = await tool_call(**tool_params)
+            elif inspect.isasyncgenfunction(tool_call):
+                # 异步生成器 - 收集所有结果（AsyncGenerator 无法由同步调用链消费）
+                chunks = [chunk async for chunk in tool_call(**tool_params)]
+                result = chunks[0] if len(chunks) == 1 else "".join(str(c) for c in chunks)
+            elif inspect.isgeneratorfunction(tool_call):
+                # 同步生成器 - 透传，由调用方消费（支持流式输出）
+                return tool_call(**tool_params)
+                # result = list(tool_call(**tool_params))
+                # if len(result) == 1:
+                #     result = result[0]
+            else:
+                # 普通函数 - 直接调用
+                result = tool_call(**tool_params)
+
+            # 将结果转换为字符串（OpenAI 要求 tool content 必须是字符串）
+            return self._serialize_result(result)
+        except Exception as e:
+            return f"{format_lightagent_error(e, 'execute tool', default_code='LA-TOOL')}\n{traceback.format_exc()}"
+
+    def _serialize_result(self, result: Any) -> str:
+        """将任意类型的结果序列化为字符串"""
+        if result is None:
+            return "Tool executed successfully (no output)"
+        elif isinstance(result, (dict, list)):
+            return json.dumps(result, ensure_ascii=False)
+        else:
+            return str(result)
+
+    # 只做两件事：必填检查，类型检查
+    def _validate_tool_params(self, tool_name: str, tool_params: Dict[str, Any]) -> str | None:
+        """Validate required tool parameters and basic JSON-schema-like types."""
+        tool_info = self.function_info.get(tool_name) or {}
+        params = tool_info.get("tool_params") or []
+        if not params:
+            return None
+
+        if not isinstance(tool_params, dict):
+            return format_error_code("LA-TOOL", f"Tool `{tool_name}` arguments must be an object.")
+
+        for param in params:
+            name = param.get("name")
+            if not name:
+                continue
+            required = bool(param.get("required", False))
+            if required and name not in tool_params:
+                return format_error_code("LA-TOOL", f"Tool `{tool_name}` missing required parameter `{name}`.")
+            if name in tool_params and not self._matches_declared_type(tool_params[name], param.get("type")):
+                expected = param.get("type")
+                actual = type(tool_params[name]).__name__
+                return format_error_code(
+                    "LA-TOOL",
+                    f"Tool `{tool_name}` parameter `{name}` expected `{expected}`, got `{actual}`.",
+                )
+        return None
+
+    @staticmethod
+    def _matches_declared_type(value: Any, declared_type: Any) -> bool:
+        if declared_type is None:
+            return True
+        if isinstance(declared_type, str):
+            normalized = declared_type.lower()
+        else:
+            normalized = str(declared_type).lower()
+
+        if normalized in ("string", "str"):
+            return isinstance(value, str)
+        if normalized in ("integer", "int"):
+            return isinstance(value, int) and not isinstance(value, bool)
+        if normalized in ("number", "float"):
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if normalized in ("boolean", "bool"):
+            return isinstance(value, bool)
+        if normalized in ("array", "list"):
+            return isinstance(value, list)
+        if normalized in ("object", "dict"):
+            return isinstance(value, dict)
+        return True
+
+    async def async_stream_generator(self, async_gen: AsyncGenerator) -> AsyncGenerator[str, None]:
+        async for chunk in async_gen:
+            yield chunk
+
+    def stream_generator(self, sync_gen: Generator) -> Generator[str, None, None]:
+        for chunk in sync_gen:
+            yield chunk

@@ -1,0 +1,227 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+LightAgent error taxonomy and user-facing formatting helpers.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class LightAgentErrorInfo:
+    code: str
+    message: str
+    guidance: str
+
+
+class LightAgentError(Exception):
+    """Catchable structured LightAgent exception."""
+
+    def __init__(
+            self,
+            code: str,
+            message: str | None = None,
+            guidance: str | None = None,
+            details: Any = None,
+    ):
+        info = ERROR_TAXONOMY.get(code, ERROR_TAXONOMY["LA-UNKNOWN"])
+        self.code = info.code
+        self.message = message or info.message
+        self.guidance = guidance or info.guidance
+        self.details = details
+        super().__init__(self.__str__())
+
+    def __str__(self) -> str:
+        text = f"[{self.code}] {self.message} Guidance: {self.guidance}"
+        if self.details is not None:
+            text = f"{text} Details: {self.details}"
+        return text
+
+
+ERROR_TAXONOMY = {
+    "LA-400": LightAgentErrorInfo(
+        "LA-400",
+        "Invalid request sent to the model provider.",
+        "Check the request parameters, tool schema, message format, and model name.",
+    ),
+    "LA-401": LightAgentErrorInfo(
+        "LA-401",
+        "Authentication failed.",
+        "Check that api_key or OPENAI_API_KEY is set and valid for the configured provider.",
+    ),
+    "LA-403": LightAgentErrorInfo(
+        "LA-403",
+        "The provider rejected this request because of permissions or policy.",
+        "Check account permissions, model access, and provider-side safety or quota settings.",
+    ),
+    "LA-404": LightAgentErrorInfo(
+        "LA-404",
+        "The requested endpoint or model was not found.",
+        "Check base_url and model. For OpenAI-compatible local servers, base_url should end at /v1.",
+    ),
+    "LA-408": LightAgentErrorInfo(
+        "LA-408",
+        "The model request timed out.",
+        "Retry the request, reduce input size, or increase provider/client timeout settings.",
+    ),
+    "LA-413": LightAgentErrorInfo(
+        "LA-413",
+        "The request or response exceeded the provider limit.",
+        "Reduce the prompt, history, tool output, or requested completion size.",
+    ),
+    "LA-429": LightAgentErrorInfo(
+        "LA-429",
+        "Rate limit or quota was exceeded.",
+        "Wait before retrying, reduce concurrency, or check provider quota and billing status.",
+    ),
+    "LA-500": LightAgentErrorInfo(
+        "LA-500",
+        "The model provider returned a server error.",
+        "Retry later or switch to another compatible provider endpoint.",
+    ),
+    "LA-503": LightAgentErrorInfo(
+        "LA-503",
+        "The model provider is temporarily unavailable.",
+        "Retry later, reduce traffic, or use a fallback model/provider.",
+    ),
+    "LA-JSON": LightAgentErrorInfo(
+        "LA-JSON",
+        "A tool call argument could not be parsed as JSON.",
+        "Check that the model returned valid tool-call JSON matching the registered tool schema.",
+    ),
+    "LA-TOOL": LightAgentErrorInfo(
+        "LA-TOOL",
+        "Tool execution failed.",
+        "Check the tool implementation, required arguments, dependencies, and external service credentials.",
+    ),
+    "LA-RETRY": LightAgentErrorInfo(
+        "LA-RETRY",
+        "The agent reached its tool-call round limit without a final answer.",
+        "Raise max_retry / max_tool_iterations, or simplify the task so it finishes within the limit.",
+    ),
+    "LA-GUARDRAIL": LightAgentErrorInfo(
+        "LA-GUARDRAIL",
+        "A configured guardrail blocked this operation.",
+        "Review the configured input, tool, or output guardrail policy and adjust the request if appropriate.",
+    ),
+    "LA-HOOK": LightAgentErrorInfo(
+        "LA-HOOK",
+        "A configured runtime hook blocked this operation.",
+        "Review the hook decision, configured phase, and application policy before retrying.",
+    ),
+    "LA-POLICY": LightAgentErrorInfo(
+        "LA-POLICY",
+        "The unified capability policy denied this operation.",
+        "Review Provider scope, permission snapshots, approval requirements, and Policy decisions.",
+    ),
+    "LA-SANDBOX": LightAgentErrorInfo(
+        "LA-SANDBOX",
+        "This operation requires an explicit sandbox.",
+        "Register an isolated SandboxProvider before enabling execution-capable tools.",
+    ),
+    "LA-BUDGET": LightAgentErrorInfo(
+        "LA-BUDGET",
+        "The configured runtime budget was exhausted.",
+        "Increase the relevant budget or resume with a narrower goal, tool set, or context.",
+    ),
+    "LA-SESSION": LightAgentErrorInfo(
+        "LA-SESSION",
+        "Session persistence or replay failed.",
+        "Inspect the SessionStore, event sequence, schema version, and latest checkpoint.",
+    ),
+    "LA-PROVIDER": LightAgentErrorInfo(
+        "LA-PROVIDER",
+        "A capability Provider failed or is unavailable.",
+        "Inspect Provider health, lifecycle state, configuration digest, and optional dependencies.",
+    ),
+    "LA-APPROVAL": LightAgentErrorInfo(
+        "LA-APPROVAL",
+        "This operation is waiting for explicit approval.",
+        "Resolve the approval request and resume the same Session or workflow run.",
+    ),
+    "LA-CANCELLED": LightAgentErrorInfo(
+        "LA-CANCELLED",
+        "The run, Job, workflow, or Session was cancelled.",
+        "Inspect the cancellation event and resume from a checkpoint when the operation is resumable.",
+    ),
+    "LA-UNKNOWN": LightAgentErrorInfo(
+        "LA-UNKNOWN",
+        "An unexpected LightAgent error occurred.",
+        "Enable debug logging and inspect the original exception details.",
+    ),
+}
+
+
+def classify_exception(exc: BaseException, default_code: str = "LA-UNKNOWN") -> LightAgentErrorInfo:
+    """Classify common provider and runtime exceptions into stable LightAgent codes."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None and getattr(exc, "response", None) is not None:
+        status_code = getattr(exc.response, "status_code", None)
+
+    if status_code in (400,):
+        return ERROR_TAXONOMY["LA-400"]
+    if status_code in (401,):
+        return ERROR_TAXONOMY["LA-401"]
+    if status_code in (403,):
+        return ERROR_TAXONOMY["LA-403"]
+    if status_code in (404,):
+        return ERROR_TAXONOMY["LA-404"]
+    if status_code in (408,):
+        return ERROR_TAXONOMY["LA-408"]
+    if status_code in (413,):
+        return ERROR_TAXONOMY["LA-413"]
+    if status_code in (429,):
+        return ERROR_TAXONOMY["LA-429"]
+    if status_code in (500, 502):
+        return ERROR_TAXONOMY["LA-500"]
+    if status_code in (503, 504):
+        return ERROR_TAXONOMY["LA-503"]
+
+    name = exc.__class__.__name__.lower()
+    text = str(exc).lower()
+    if "authentication" in name or "unauthorized" in text or "api key" in text:
+        return ERROR_TAXONOMY["LA-401"]
+    if "permission" in name or "forbidden" in text:
+        return ERROR_TAXONOMY["LA-403"]
+    if "notfound" in name or "not found" in text:
+        return ERROR_TAXONOMY["LA-404"]
+    if "timeout" in name or "timed out" in text:
+        return ERROR_TAXONOMY["LA-408"]
+    if "ratelimit" in name or "rate limit" in text or "quota" in text:
+        return ERROR_TAXONOMY["LA-429"]
+    if "context length" in text or "maximum context" in text or "too large" in text:
+        return ERROR_TAXONOMY["LA-413"]
+
+    return ERROR_TAXONOMY.get(default_code, ERROR_TAXONOMY["LA-UNKNOWN"])
+
+
+def format_lightagent_error(exc: BaseException, action: str | None = None, default_code: str = "LA-UNKNOWN") -> str:
+    """Return a concise user-facing error with a stable code and troubleshooting hint."""
+    info = classify_exception(exc, default_code=default_code)
+    prefix = f"[{info.code}] {info.message}"
+    if action:
+        prefix = f"{prefix} Action: {action}."
+    return f"{prefix} Guidance: {info.guidance} Details: {exc}"
+
+
+def format_error_code(code: str, details: Any = None) -> str:
+    """Format a known LightAgent error code with optional details."""
+    info = ERROR_TAXONOMY.get(code, ERROR_TAXONOMY["LA-UNKNOWN"])
+    message = f"[{info.code}] {info.message} Guidance: {info.guidance}"
+    if details is not None:
+        message = f"{message} Details: {details}"
+    return message
+
+
+def is_error_text(value: Any) -> bool:
+    """判断一个值是否是 LightAgent 的错误输出。
+
+    统一判定标准：所有错误输出都以 ``[LA-`` 开头（见 ERROR_TAXONOMY）。
+    此前项目里有 5 处各自判断（`[LA-` / `[LA-GUARDRAIL]` / 无前缀），
+    导致“输出钩子拦截对外报错、对内记成功”和“轮次耗尽对外无错误标记”两类不一致。
+    """
+    return isinstance(value, str) and value.startswith("[LA-")

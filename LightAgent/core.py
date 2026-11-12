@@ -1,0 +1,3341 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+作者: [weego/WXAI-Team]
+最后更新: 2026-02-07
+"""
+
+import asyncio
+import concurrent.futures
+import inspect
+import threading
+import json
+import os
+import random
+import re
+import time
+import traceback
+from copy import deepcopy
+from datetime import datetime
+from typing import List, Dict, Any, Callable, Union, Optional, Generator, AsyncGenerator, Protocol, TypeVar, Coroutine
+from uuid import uuid4
+
+import httpx
+from openai.types.chat import ChatCompletionChunk
+
+# 从各子模块导入
+from .version import __version__
+from .protocol import (
+    MemoryCandidate,
+    MemoryPolicy,
+    MemoryProtocol,
+    MemoryPromotionDecision,
+    MemoryScope,
+)
+from .logger import LoggerManager
+from .tools import ToolRegistry, ToolLoader, AsyncToolDispatcher
+from .cancellation import CancellationToken
+from .errors import format_error_code, format_lightagent_error, is_error_text
+from .result import RunResult, StreamEvent
+from .tracing import TraceRecorder, export_trace, normalize_usage, summarize_trace
+from .hooks import HOOK_BLOCK, HookContext, HookDecision, HookManager, PolicyHook
+from .guardrails import GuardrailManager
+from .mcp_client_manager import MCPClientManager
+from .skills import SkillManager
+from .skill_tools import create_skill_tools
+from .capabilities import (
+    CapabilityRegistry,
+    CapabilityRisk,
+    CapabilityScope,
+    CapabilitySpec,
+    MemoryProviderAdapter,
+    PolicyEngine,
+    PolicyRequest,
+    ToolProviderAdapter,
+)
+from .runtime import AgentRuntime, BudgetExceeded, BudgetLimits
+from .session import (
+    ContextBudget,
+    ContextCompactor,
+    ContextProjector,
+    Session,
+    SessionStore,
+)
+# 新增：导入内置工具
+from .builtin_tools.python_executor import (
+    execute_python_code,
+    execute_python_file,
+    execute_python_code_stream,
+    UNSAFE_PYTHON_TOOL_REASON,
+    is_unsafe_python_tool,
+)
+from .builtin_tools.nos import upload_file_to_oss
+from .builtin_tools.safe_expression import safe_expression
+
+
+# TypeVar for generic coroutine return type
+T = TypeVar('T')
+
+
+def run_async_safely(coro: Coroutine[Any, Any, T]) -> T:
+    """
+    Safely run an async coroutine, handling the case where we're already
+    inside an event loop (e.g., FastAPI, Jupyter, etc.).
+
+    This solves the "RuntimeError: asyncio.run() cannot be called from a
+    running event loop" issue by detecting the current context and using
+    the appropriate execution strategy.
+
+    Args:
+        coro: The coroutine to execute
+
+    Returns:
+        The result of the coroutine
+
+    Raises:
+        Any exception raised by the coroutine
+    """
+    try:
+        # Check if we're already in an event loop
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running event loop, safe to use asyncio.run()
+        return asyncio.run(coro)
+
+    # We're inside an event loop - need alternative execution strategy
+    # Run the coroutine in a separate thread with its own event loop
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(asyncio.run, coro)
+        return future.result()
+
+# openai.langfuse_auth_check()
+
+class LightAgent:
+    __version__ = __version__
+
+    def __init__(
+            self,
+            *,
+            # 身份：决定system prompt前两行
+            name: Optional[str] = None,  # 代理名称
+            instructions: Optional[str] = None,  # 代理指令
+            role: Optional[str] = None,  # 代理角色
+
+            # 模型：决定请求发到哪
+            model: str,  # agent模型名称
+            api_key: str | None = None,  # 模型 api key
+            base_url: str | httpx.URL | None = None,  # 模型 base url
+            provider: str | None = None,  # LLM provider ("litellm" to route via LiteLLM SDK) 决定用哪套 SDK 去调模型
+            websocket_base_url: str | httpx.URL | None = None,  # 模型 websocket base url
+
+            # 记忆：跨会话的用户信息
+            memory: Optional[MemoryProtocol] = None,  # 支持外部传入记忆模块
+            memory_policy: Optional[MemoryPolicy] = None,  # 记忆安全策略
+            memory_namespace: Optional[str] = None,  # 记忆命名空间快捷配置
+            self_learning: bool = False,  # 是否启用agent自我学习
+
+            # 工具：决定模型能调什么
+            filter_tools: bool = True,  # 是否启用工具过滤
+            tools: List[Union[str, Callable]] = None,  # 支持工具混合输入
+            enable_unsafe_python: bool = False,  # 兼容注册；旧执行器不能由模型调度
+
+            # 技能：决定加载哪些SKILL.md
+            skills_directories: List[str] = None,  # 支持技能混合输入
+            auto_discover_skills: bool = True,  # 是否自动发现技能
+
+            # 安全：三道闸+中间件
+            input_guardrails: List[Callable[..., Any]] | None = None,  # 输入安全策略
+            tool_guardrails: List[Callable[..., Any]] | None = None,  # 工具调用安全策略
+            output_guardrails: List[Callable[..., Any]] | None = None,  # 输出安全策略
+            hooks: List[Callable[..., Any] | PolicyHook] | None = None,  # 运行期 hook / middleware
+
+            # 会话：事件溯源与资源限制
+            session_store: SessionStore | None = None,  # v0.10 Session 持久化后端
+            capability_registry: CapabilityRegistry | None = None,  # v0.10 能力注册表
+            policy_engine: PolicyEngine | None = None,  # v0.10 统一能力策略
+            budget_limits: BudgetLimits | None = None,  # v0.10 长任务预算
+            context_budget: ContextBudget | None = None,  # 可选模型上下文预算
+
+            context_compactor: ContextCompactor | None = None,  # 可选上下文压缩器
+            client_max_retries: int = 2,  # OpenAI SDK 的请求重试次数（框架层本身不重试）
+            client_timeout: float | None = None,  # SDK 请求超时（秒）；None 用 SDK 默认的 600s
+
+            # 观测：日志与追踪
+            debug: bool = False,  # 是否启用调试模式
+            log_level: str = "INFO",  # 日志级别（INFO, DEBUG, ERROR）
+            log_file: Optional[str] = None,  # 日志文件路径
+            tracetools: Optional[dict] = None,  # log跟踪工具
+            tree_of_thought: bool = False,  # 是否启用链式思考
+            tot_model: str | None = None,  # 链式思考模型
+            tot_api_key: str | None = None,  # 链式思考模型API密钥
+            tot_base_url: str | httpx.URL | None = None,  # 链式思考模型base_url
+    ) -> None:
+        """
+        初始化 LightAgent。
+
+        :param name: 代理名称。
+        :param instructions: 代理指令。
+        :param role: Agent 的角色描述。
+        :param model: 使用的模型名称。
+        :param api_key: API 密钥。
+        :param base_url: API 的基础 URL。
+        :param provider: 可选模型供应商路由。传入 "litellm" 时通过 LiteLLM SDK 调用模型。
+        :param websocket_base_url: WebSocket 的基础 URL。
+        :param memory: 外部传入的记忆模块，需实现 `retrieve` 和 `store` 方法。
+        :param memory_policy: 可选记忆安全策略，用于共享记忆后端的命名空间与检索过滤。
+        :param memory_namespace: 记忆命名空间快捷配置，会生成默认 MemoryPolicy。
+        :param tree_of_thought: 是否启用思维链功能。
+        :param tot_model: 使用的模型名称。
+        :param tot_api_key: API 密钥。
+        :param tot_base_url: API 的基础 URL。
+        :param filter_tools: 是否启用工具过滤。
+        :param tools: 工具列表，支持函数名称（字符串）或函数对象。
+        :param enable_unsafe_python: 是否兼容注册旧 Python 执行工具；模型调度始终阻断，应用可直接调用。
+        :param input_guardrails: 输入安全策略列表，返回 False、原因字符串、dict 或 GuardrailDecision 可阻止运行。
+        :param tool_guardrails: 工具调用安全策略列表，返回 False、原因字符串、dict 或 GuardrailDecision 可阻止工具执行。
+        :param output_guardrails: 输出安全策略列表，返回 False、原因字符串、dict 或 GuardrailDecision 可阻止非流式输出。
+        :param hooks: 运行期 hook 列表，可观察、替换或阻断指定生命周期阶段。
+        :param session_store: 可选 SessionStore；默认使用进程内存储且不影响旧调用方式。
+        :param capability_registry: 可选 CapabilityRegistry，用于统一 Provider 生命周期与策略。
+        :param policy_engine: 可选能力策略引擎；传入 registry 时应优先配置 registry 自身策略。
+        :param budget_limits: 可选模型调用、工具调用、token、时间和成本预算。
+        :param context_budget: 可选上下文 token 预算。
+        :param context_compactor: 可选两阶段上下文压缩器。
+        :param debug: 是否启用调试模式。
+        :param log_level: 日志级别（INFO, DEBUG, ERROR）。
+        :param log_file: 日志文件路径。
+        :param tracetools: log跟踪工具。
+        """
+        # ——————————————————————————————————————————————————————————————————————————————————————————————————
+        # 初始化核心组件
+        # 阶段1：先把MCP位置占住，然后校验provider
+        # 这段要解决什么：后面要往里面装工具，所以先把装工具的地方准备好。
+        self.tool_registry = ToolRegistry()
+        self.tool_loader = ToolLoader()
+        self.mcp_setting = None       # 占位
+        self.mcp_client = None
+        if provider not in (None, "litellm"):     # fail-fast
+            raise ValueError("provider must be None or 'litellm'")
+        # ——————————————————————————————————————————————————————————————————————————————————————————————————
+        # 阶段2： 没传的值怎么补上
+        # 这段要解决什么：用户可能没传 api_key、没传 name。这段负责"你没给，我帮你定一个"。
+        # 调用方没给，就按优先级往下兜
+        if not model:
+            model = "gpt-4o-mini"  # 默认模型
+        if not api_key:
+            api_key = os.environ.get("OPENAI_API_KEY")
+        if not base_url:
+            base_url = os.environ.get("OPENAI_BASE_URL")
+        self.loaded_tools = {}  # 用于存储已加载的工具函数
+        if not name:
+            random_suffix = random.randint(10000000, 99999999)  # 生成一个8位随机数作为agent编号
+            name = f"LightAgent{random_suffix}"
+        self.name = name
+        if not instructions:
+            instructions = "You are a helpful agent."
+        self.instructions = instructions
+        self.role = role
+        self.model = model
+        self.memory = memory
+        self.memory_policy = memory_policy or MemoryPolicy(namespace=memory_namespace)  # A or B ，如果A为真，B 根本不会被求值
+        # ——————————————————————————————————————————————————————————————————————————————————————————————————
+        # 阶段3：挂3个能干活的东西
+        # 这段要解决什么：把用户传进来的三份配置，变成三个能干活的对象。
+        # 三个管理器一次挂载
+        # -------------------------------------
+        self.guardrails = GuardrailManager(
+            input_guardrails=input_guardrails,
+            tool_guardrails=tool_guardrails,
+            output_guardrails=output_guardrails,
+        )
+        self.hooks = HookManager(hooks)
+        # -------------------------------------
+        self.tree_of_thought = tree_of_thought
+        self.self_learning = self_learning
+        self.filter_tools = filter_tools
+
+        self.debug = debug
+        self.log_level = log_level.upper()
+        self.traceid = ""  # 用于存储 traceid
+        self._current_run_id = ""
+        self._current_user_id = "default_user"
+        self._current_run_metadata: dict[str, Any] = {}
+        self._parent_trace_id: str | None = None
+        self._run_group_id: str | None = None
+        self._memory_promotion_candidates: list[MemoryCandidate] = []
+        self.context_budget = context_budget
+        self.context_compactor = context_compactor or ContextCompactor()   # 执行器
+        self.client_max_retries = client_max_retries
+        self.client_timeout = client_timeout
+        # ——————————————————————————————————————————————————————————————————————————————————————————————————
+        # 阶段4：创建日志
+        # 这段要解决什么：决定要不要记日志、日志写到哪里。
+        # 确保 log 目录存在
+        log_dir = 'logs'
+        # 将 log_file 路径设置为 log 目录下的文件
+        if debug:
+            if not os.path.exists(log_dir):
+                os.makedirs(log_dir)
+            if not log_file:
+                log_file = f"{self.name}.log"
+            self.log_file = os.path.join(log_dir, log_file)
+            # Set up the logger
+            # 初始化日志系统
+            self.logger = LoggerManager(
+                name=self.name,
+                debug=debug,
+                log_level=log_level,
+                log_file=self.log_file
+            )
+
+        # 初始化技能管理器
+        self.skills_directories = skills_directories or ["skills"]
+        # self.logger if debug else None ——> A if cond else B :条件为真就取A，条件为假就去B
+        self.skill_manager = SkillManager(self.skills_directories, self.logger if debug else None)
+        # ——————————————————————————————————————————————————————————————————————————————————————————————————
+        # 阶段5：往注册表里塞工具（把四批工具一次放进tool_registry，最后建一个调用它们的调度器）
+        # 第一批：用户传入的工具
+        self.tools = tools or []
+        if self.tools:
+            # load_tools支持两种输入：函数对象或函数名字符串 （后者会去tools_directory里找），对应“支持工具混合输入”
+            self.load_tools(self.tools)
+
+        # Safe expression evaluation is available by default. Arbitrary Python
+        # registration is retained for compatibility, but tool dispatch stays
+        # blocked until an actual isolated execution route is implemented.
+        # 第二批：框架自带的两个工具safe_expression, upload_file_to_oss。前者算数学表达式，后者上传文件到阿里云OSS
+        builtin_tools = [safe_expression, upload_file_to_oss]
+        if enable_unsafe_python:
+            builtin_tools.extend([
+                execute_python_code,
+                execute_python_file,
+                execute_python_code_stream,
+            ])
+
+        for tool_func in builtin_tools:
+            self.tool_registry.register_tool(tool_func)
+            self.loaded_tools[tool_func.tool_info["tool_name"]] = tool_func
+
+        if debug:
+            self.log("INFO", "builtin_tools_loaded",
+                     {"count": len(builtin_tools), "tools": [f.tool_info["tool_name"] for f in builtin_tools]})
+
+        # 第三批：自动发现skill技能
+        if auto_discover_skills:
+            discovered = self.skill_manager.discover_skills()
+            if debug and discovered:
+                self.log("INFO", "skills_discovered",
+                         {"count": len(discovered), "skills": [s.name for s in discovered]})
+        # 自动加载自带的skill相关的系统级工具
+        if auto_discover_skills and self.skill_manager.skills:
+            skill_tools = create_skill_tools(self.skill_manager)
+            for tool_func in skill_tools:
+                self.tool_registry.register_tool(tool_func)
+                self.loaded_tools[tool_func.tool_info["tool_name"]] = tool_func
+            if debug:
+                self.log("INFO", "skill_tools_loaded",
+                         {"count": len(skill_tools), "tools": [f.tool_info["tool_name"] for f in skill_tools]})
+
+        # 最后：调度器（负责实际调用前面的工具）
+        # self.tool_registry.function_mappings给自己用，self.tool_registry.function_info发给模型看
+        self.tool_dispatcher = AsyncToolDispatcher(self.tool_registry.function_mappings, self.tool_registry.function_info)
+        # register_tool_manually(tools)
+
+        # 检查来的太晚了，logs目录建完了，skills扫完了，注册了三批工具，建了调度器才检查
+        if api_key is None:
+            raise ValueError(
+                "The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable"
+            )
+        self.api_key = api_key
+        self.websocket_base_url = websocket_base_url
+        self.provider = provider
+        self.base_url = base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+
+        if self.tree_of_thought:  # 并非是思维树，严格说是CoT（普通思维链） + 一次自我反思
+            if tot_api_key is None:
+                tot_api_key = self.api_key
+            if tot_base_url is None:
+                tot_base_url = self.base_url
+            if not tot_model:
+                tot_model = "deepseek-flash"  # 默认思维推理模型为deepseek-flash
+            self.tot_model = tot_model
+        # ——————————————————————————————————————————————————————————————————————————————————————
+        # 阶段6：检查密钥和建客户端
+        # 这段要解决什么：确认有 key，然后根据 provider 选一个客户端去调模型。
+        # 初始化客户端
+        self._initialize_clients(tracetools, tot_api_key, tot_base_url, tot_model)
+        self.tracetools = tracetools
+        # ——————————————————————————————————————————————————————————————————————————————————————
+        # 阶段7：把运行时装起来
+        # 这段要解决什么：建最后一层——管理会话、能力、预算的运行时。
+        self.chat_params = {}  # 空的请求参数字典，每次 run() 会重新填
+        self._trace_recorder = TraceRecorder(enabled=False)
+        registry = capability_registry or CapabilityRegistry(policy_engine=policy_engine)
+        if capability_registry is not None and policy_engine is not None:
+            registry.policy_engine = policy_engine
+        self.runtime = AgentRuntime(
+            session_store=session_store,
+            capability_registry=registry,
+            budget_limits=budget_limits,
+        )
+        self.capability_registry = self.runtime.registry
+        self.capability_registry.audit = self._record_session_event   # 能力每被使用一次，就写一条记录进会话
+        self._register_builtin_providers()
+        self._current_session_id: str | None = None
+        self._current_turn_id: str | None = None
+        self._session_turn_finished = True
+        self._session_store_error: str | None = None
+
+    def _initialize_clients(self, tracetools, tot_api_key, tot_base_url, tot_model):
+        """初始化 OpenAI 客户端"""
+        if self.provider == "litellm":
+            from .litellm_client import LiteLLMClient
+            self.client = LiteLLMClient(
+                api_key=self.api_key,
+                base_url=self.base_url if self.base_url != "https://api.openai.com/v1" else None,
+            )
+            if self.tree_of_thought:
+                self.tot_client = LiteLLMClient(
+                    api_key=tot_api_key or self.api_key,
+                    base_url=tot_base_url if tot_base_url and tot_base_url != "https://api.openai.com/v1" else None,
+                )
+        elif tracetools:
+            from langfuse.openai import openai as la_openai
+            la_openai.langfuse_public_key = tracetools['TraceToolConfig']['langfuse_public_key']
+            la_openai.langfuse_secret_key = tracetools['TraceToolConfig']['langfuse_secret_key']
+            la_openai.langfuse_enabled = tracetools['TraceToolConfig']['langfuse_enabled']
+            la_openai.langfuse_host = tracetools['TraceToolConfig']['langfuse_host']
+            la_openai.base_url = self.base_url
+            la_openai.api_key = self.api_key
+            self.client = la_openai
+
+            if self.tree_of_thought:
+                la_openai.base_url = tot_base_url or self.base_url
+                la_openai.api_key = tot_api_key or self.api_key
+                self.tot_client = la_openai
+        else:
+            from openai import OpenAI as la_openai
+            self.client = la_openai(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                max_retries=self.client_max_retries,
+                **({"timeout": self.client_timeout} if self.client_timeout else {}),
+            )
+            if self.tree_of_thought:
+                self.tot_client = la_openai(
+                    base_url=tot_base_url or self.base_url,
+                    api_key=tot_api_key or self.api_key,
+                    max_retries=self.client_max_retries,
+                    **({"timeout": self.client_timeout} if self.client_timeout else {}),
+                )
+
+    def get_history(self) -> List[Dict[str, Any]]:
+        """
+        获取对话的history的描述（OpenAI 格式）
+        """
+        return deepcopy(self.chat_params.get('messages', []))
+
+    def get_tools(self) -> List[Dict[str, Any]]:
+        """
+        获取所有工具的描述（OpenAI 格式）
+        """
+        return deepcopy(self.tool_registry.get_tools())
+
+    def validate_tools(self) -> List[Dict[str, str]]:
+        """Return diagnostics for the currently registered tool schemas."""
+        return self.tool_registry.validate_tools()
+
+    def list_memory_candidates(self, *, include_data: bool = True) -> List[Dict[str, Any]]:
+        """Return non-injectable memory candidates from the most recent run."""
+        return [
+            candidate.to_dict(include_data=include_data)
+            for candidate in getattr(self, "_memory_promotion_candidates", [])
+        ]
+
+    def promote_memory_candidate(
+            self,
+            candidate_id: str,
+            decision: MemoryPromotionDecision | Dict[str, Any] | bool | None = None,
+    ) -> bool:
+        """Explicitly promote, reject, rewrite, or keep a pending memory candidate."""
+        candidate = self._find_memory_candidate(candidate_id)
+        if candidate is None:
+            raise ValueError(f"Memory candidate `{candidate_id}` was not found.")
+        if candidate.status == "promoted":
+            self._record_trace("memory_promotion_idempotent", {
+                **self._memory_candidate_trace(candidate),
+                "manual": True,
+            })
+            return True
+
+        if decision is None:
+            promotion_decision = MemoryPromotionDecision.approve(candidate.data)
+        elif isinstance(decision, MemoryPromotionDecision):
+            promotion_decision = decision
+        else:
+            promotion_decision = self.memory_policy._coerce_promotion_decision(decision, candidate.data)
+
+        context = self._memory_promotion_context(candidate)
+        return self._apply_memory_promotion_decision(candidate, promotion_decision, context, manual=True)
+
+    def get_tool(self, tool_name: str) -> Callable:
+        """
+        用于外部可以获取已加载的工具函数
+        :param tool_name: 工具名称
+        :return: 工具函数
+        """
+        if tool_name in self.loaded_tools:
+            return self.loaded_tools[tool_name]
+        raise ValueError(f"Tool `{tool_name}` is not loaded.")
+
+    def load_tools(self, tool_names: List[Union[str, Callable]], tools_directory: str = "tools"):
+        """加载并注册工具"""
+        for tool in tool_names:
+            if isinstance(tool, str):
+                try:
+                    tool_func = self.tool_loader.load_tool(tool)
+                    self.tool_registry.register_tool(tool_func)
+                    self.loaded_tools[tool] = tool_func
+                    self.log("DEBUG", "load_tools", {"tool": tool, "status": "success"})
+                except Exception as e:
+                    self.log("ERROR", "load_tools", {"tool": tool, "error": str(e)})
+            elif callable(tool) and hasattr(tool, "tool_info"):
+                if self.tool_registry.register_tool(tool):
+                    tool_name = tool.tool_info.get("tool_name") or tool.__name__
+                    self.loaded_tools[tool_name] = tool
+                    self.log("DEBUG", "register_tool", {"tool": tool.__name__, "status": "success"})
+
+    async def setup_mcp(
+            self,
+            mcp_setting: dict | None = None,  # mcp 设置
+    ):
+        if mcp_setting:
+            self.mcp_setting = mcp_setting
+        """单独初始化 MCP 模块"""
+        if self.mcp_setting and not self.mcp_client:
+            self.mcp_client = MCPClientManager(self.mcp_setting, self.tool_registry)
+            await self.mcp_client.register_mcp_tool()
+            self.log("INFO", "setup_mcp", "MCP 模块初始化成功")
+
+    def log(self, level, action, data):
+        """
+        日志打印入口
+        """
+        if not self.debug:
+            return
+        self.logger.log(level, action, data)
+
+    def run(
+            self,
+            query: str,
+            tools: List[Union[str, Callable]] | None = None,  # 运行时传入的工具
+            light_swarm=None,
+            stream: bool = False,
+            max_retry: int = 10,
+            max_tool_iterations: Optional[int] = None,
+            user_id: str = "default_user",
+            history: list = None,
+            metadata: Optional[Dict] = None,
+            use_skills: bool = True,  # 是否使用技能
+            result_format: str = "str",
+            trace: bool = False,
+            parent_trace_id: str | None = None,
+            run_group_id: str | None = None,
+            approval_id: str | None = None,
+            session_id: str | None = None,
+            cancellation_token: CancellationToken | None = None,
+            idempotency_key: str | None = None,
+    ) -> Union[Generator[str, None, None], str, RunResult]:
+        """
+        运行代理，处理用户输入。
+
+        :param query: 用户输入。
+        :param tools: 运行时传入的工具列表，支持函数名称（字符串）或函数对象。
+        :param light_swarm: LightSwarm 实例，用于任务转移。
+        :param stream: 是否启用流式输出。
+        :param max_retry: 工具循环的最大轮次（历史名称，与请求重试无关）。
+        :param max_tool_iterations: 流式工具调用的最大循环轮次；默认沿用 max_retry 保持兼容。
+        :param user_id: 用户 ID。
+        :param history: 历史对话 。
+        :param metadata: 元数据。
+        :param use_skills: 是否使用技能。
+        :param result_format: 返回格式。默认 "str" 保持兼容；非流式可用 "object" 返回 RunResult；流式可用 "event" 返回 StreamEvent。
+        :param trace: 是否收集结构化运行轨迹。默认 False 保持轻量；配合 result_format="object" 或 export_trace() 使用。
+        :param parent_trace_id: 可选父 trace，用于 LightFlow、LightSwarm 或应用层嵌套调用。
+        :param run_group_id: 可选运行组 ID，用于把多个 sibling traces 归到同一任务。
+        :param approval_id: 可选人工审批请求 ID，仅传给运行期 hooks，不发送给模型服务。
+        :param session_id: 可选持久化 Session ID。省略时每次调用创建独立的内存 Session。
+        :param cancellation_token: 可选协作式取消令牌，在模型和工具调用安全边界检查。
+        :param idempotency_key: 可选调用幂等键，记录到 Session 和 Trace 供上层执行器关联。
+        :return: 代理的回复。
+        """
+        # ——————————————————————————————————————————————————————————————————————————————————————————————————————————————
+        # 段1：四道检验
+        # result_format与stream是联动的。stream:False, result_format:"event"组合非法；stream:True, result_format:"object/dict"组合非法
+        if result_format not in ("str", "object", "dict", "event"):
+            raise ValueError("result_format must be one of: str, object, dict, event")
+        if not stream and result_format == "event":
+            raise ValueError("result_format='event' requires stream=True")
+        if stream and result_format in ("object", "dict"):
+            raise ValueError("stream=True supports result_format='str' or result_format='event'")
+        # max_tool_iterations 在非流式路径下完全无效。
+        if max_tool_iterations is not None and max_tool_iterations < 1:
+            raise ValueError("max_tool_iterations must be at least 1")
+        # max_retry事实上被当成了工具循环的轮次上限， 管的是"最多让模型调几轮工具"，不是"失败了重试几次"。
+        effective_max_tool_iterations = max_tool_iterations if max_tool_iterations is not None else max_retry
+        # ——————————————————————————————————————————————————————————————————————————————————————————————————————————————
+        # 段2：领票记名
+        # 这段在干两件事：领两张票（trace ID 和 run ID），把本次运行的"身份信息"挂到 self 上。
+        # 设置跟踪ID
+        traceid = uuid4().hex
+        self.traceid = traceid
+        self._current_run_id = uuid4().hex
+        self._current_user_id = str(user_id)
+        self._current_run_metadata = dict(metadata or {})
+        self._current_cancellation_token = cancellation_token
+        self._current_idempotency_key = idempotency_key
+        if approval_id is not None:
+            self._current_run_metadata["approval_id"] = str(approval_id)
+        self._parent_trace_id = parent_trace_id
+        self._run_group_id = run_group_id
+        # self._trace_recorder每次都是重建的，第二次 run() 会把第一次的 trace 覆盖掉
+        self._trace_recorder = TraceRecorder(
+            enabled=trace,
+            trace_id=traceid,
+            parent_trace_id=parent_trace_id,
+            run_group_id=run_group_id,
+        )
+        # ——————————————————————————————————————————————————————————————————————————————————————————————————————————————
+        # 段3：状态清零，每次清零这次运行干了什么
+        self._current_tool_calls = []
+        self._current_usage = None
+        self._usage_totals = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        self._current_reasoning_content = ""
+        self._run_started_at = time.perf_counter()
+        self._model_request_count = 0
+        self._retry_count = 0
+        self._pending_model_trace_event = None
+        self._pending_model_started_at = None
+        self._memory_write_count = 0
+        self._memory_write_fingerprints = set()
+        self._memory_promotion_candidates = []
+        self._budget_error = None
+        # ——————————————————————————————————————————————————————————————————————————————————————————————————————————————
+        # 段4：打开记录本
+        projected_history = self._begin_session_run(
+            session_id=session_id,
+            query=query,
+            user_id=str(user_id),
+            # metadata随这次调用带过去的一组自定义标签，用来让你在日志、hook 和会话记录里认出“这次请求是谁发起的”。
+            metadata=dict(metadata or {}),
+            stream=stream,
+        )
+        # ——————————————————————————————————————————————————————————————————————————————————————————————————————————————
+        # 段5：两条记录两个出口
+        # hasattr(obj, "name") 判断对象有没有这个属性，返回 True / False，不会抛异常。属于防御性检查
+        if self.debug and hasattr(self, 'logger'):  # 仅在 debug=True 且 logger 存在时记录日志
+            self.logger.set_traceid(traceid)
+        # self.log 只给人看，格式纯文本
+        self.log("INFO", "run_start", {"query": query, "user_id": user_id, "stream": stream})
+        # self._record_trace给程序和session看，负责后续可读、可导出，而且默认就在记。
+        self._record_trace("run_start", {
+            "query": query,
+            "user_id": user_id,
+            "stream": stream,
+            "result_format": result_format,
+            "run_id": self._current_run_id,
+            "idempotency_key": idempotency_key,
+        })
+
+        # 护栏必须检查用户原话：钩子的任何改写都不影响安全判定
+        original_query = query
+
+        before_run = self._run_hooks("before_run", {                           # ① 钩子先跑
+            "query": query,
+            "tools": tools,
+            "stream": stream,
+            "result_format": result_format,
+            "metadata": dict(metadata or {}),
+        })
+        if before_run.action == HOOK_BLOCK:
+            error_msg = self._format_hook_error("before_run", before_run.reason)
+            self._finish_run(success=False, error=error_msg, stage="before_run")
+            if stream:
+                stream_result = self._error_stream(error_msg)
+                if result_format == "event":
+                    return self._stream_as_events(stream_result, traceid)
+                return stream_result
+            return self._format_run_result(error_msg, result_format, traceid, error_msg)
+        query = before_run.payload.get("query", query) if before_run.payload else query     # ② 钩子的改写生效
+
+        '''护栏抛异常，没有任何兜底。护栏内部只要抛异常，整个 run() 直接崩，调用方拿到的是 Python 异常而不是 [LA-GUARDRAIL] 错误码。'''
+        '''这和钩子的 fail-open / fail-closed 形成对比：护栏是"崩溃即拦截"（fail-closed by crash）'''
+        input_decision = self.guardrails.check_input(original_query, {                        # ③ 护栏才查
+            "agent_name": self.name,                                             # 护栏检查的是钩子处理后的query，不是用户原话
+            "user_id": user_id,
+            "trace_id": traceid,
+        })
+        if not input_decision.allowed:
+            error_msg = self._format_guardrail_error("input", input_decision.reason)
+            self._record_policy_adapter_event(
+                "before_run",
+                "input_guardrails",
+                "block",
+                reason=input_decision.reason,
+            )
+            self._record_trace("guardrail_block", {"stage": "input", "reason": input_decision.reason})
+            self._finish_run(success=False, error=error_msg, stage="input_guardrail")
+            if stream:
+                stream_result = self._error_stream(error_msg)
+                if result_format == "event":
+                    return self._stream_as_events(stream_result, traceid)
+                return stream_result
+            return self._format_run_result(error_msg, result_format, traceid, error_msg)
+        if input_decision.value is not None:
+            if input_decision.value != query:
+                self._record_policy_adapter_event("before_run", "input_guardrails", "replace")
+            query = input_decision.value
+
+        # 初始化历史记录
+        history = projected_history if history is None and session_id is not None else (history or [])
+
+        # 处理运行时传入的工具
+        runtime_tools = []
+        if tools:
+            runtime_tools = self._process_runtime_tools(tools)
+
+        # 0. 判断是否需要转移任务
+        if light_swarm:
+            handoff_run_options = {
+                "user_id": user_id,
+                "metadata": metadata,
+                "trace": trace,
+                "result_format": result_format,
+                "max_retry": max_retry,
+                "max_tool_iterations": max_tool_iterations,
+            }
+            result = self._handle_task_transfer(query, light_swarm, stream, handoff_run_options)
+            if result is not None:
+                return result
+
+        # 1. 正常处理任务
+        now = datetime.now()   # 如果写在 __init__ 里，Agent 跑一整天，模型会以为今天还是启动那天。每次请求前刷新。
+        current_date = now.strftime("%Y-%m-%d")
+        current_time = now.strftime("%H:%M:%S")
+        system_prompt = (
+            f"##代理名称：{self.name}\n"
+            f"##代理指令：{self.instructions}\n"
+            f"##身份：{self.role}\n"
+            f"请一步一步思考来完成用户的要求。尽可能完成用户的回答，如果有补充信息，请参考补充信息来调用工具，直到获取所有满足用户的提问所需的答案。\n"
+            f"今日的日期: {current_date} 当前时间: {current_time}"
+        )
+        # 添加技能元数据到系统提示
+        # 技能内容以 XML 形式塞进 system prompt，并附一句"先 activate_skill 再干活"的指令。
+        if use_skills and self.skill_manager.skills:
+            skills_xml = self.skill_manager.get_skills_xml()
+            if skills_xml:
+                system_prompt += f"\n\n## 可用技能\n{skills_xml}\n"
+                system_prompt += "当用户需求与某个技能描述匹配时，请先使用 activate_skill 工具加载完整指令。"
+        # 添加记忆上下文
+        query = self._add_memory_context(query, user_id)
+
+        # 思维链处理
+        # 开了ToT时，先跑一次run_thought(内部是一次模型调用)，拿到补充说明追加到system_prompt，
+        # 同时可能改掉activate_tools，ToT可以决定使用哪些工具
+        active_tools = []
+        if self.tree_of_thought:
+            tot_response, active_tools = self.run_thought(query, runtime_tools)
+            system_prompt += f"\n##以下是问题的补充说明\n{tot_response}"
+            self.log("DEBUG", "tree_of_thought", {"response": tot_response, "active_tools": active_tools})
+        # 如果没有启用思维链且有运行时工具，则使用运行时工具
+        elif runtime_tools:
+            active_tools = runtime_tools
+            self.log("DEBUG", "use_runtime_tools", {"runtime_tools": runtime_tools})
+
+        # 在用户查询后追加 "no_think"
+        # modified_query = query + "/no_think"
+        # 准备API参数
+        self.chat_params = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system_prompt}] + history + [
+                {"role": "user", "content": query}],
+            "stream": stream
+        }
+
+        # 添加参数
+        if metadata:
+            for key, value in metadata.items():
+                self.chat_params[key] = value
+
+        # 添加工具
+        # 优先级：active_tools > runtime_tools > 初始化时的工具
+        # ① 传了 run(tools=[...])  →  用它（不管 ToT 开没开）
+        # ② 没传，但开了 ToT 且筛出了东西  →  用筛选结果
+        # ③ 其他  →  用注册表全部（含内置工具）
+        final_tools = []
+        if active_tools:
+            final_tools = active_tools
+        elif runtime_tools:      # 死代码，只要runtime_tools非空，active_tools就必存在，且active_tools就是runtime_tools
+            final_tools = runtime_tools
+        else:
+            final_tools = self.tool_registry.get_tools()
+        # 只在有工具时才设置tools键，没工具就不传
+        if final_tools:
+            self.chat_params["tools"] = final_tools
+            self.chat_params["tool_choice"] = "auto"    # 告诉模型自己决定调不调用工具
+            self.log("DEBUG", "final_tools_selected",
+                     {"tools": [t.get("function", {}).get("name", str(t)) for t in final_tools]})
+
+        # 添加跟踪会话
+        if hasattr(self, 'tracetools') and self.tracetools:
+            self.chat_params["session_id"] = traceid
+
+        # 调用模型
+        self.log("DEBUG", "first_request_params", {"params": self.chat_params})
+        hook_error = self._prepare_model_request()
+        if hook_error:
+            self._finish_run(success=False, error=hook_error, stage="before_model_request")
+            if stream:
+                stream_result = self._error_stream(hook_error)
+                if result_format == "event":
+                    return self._stream_as_events(stream_result, traceid)
+                return stream_result
+            return self._format_run_result(hook_error, result_format, traceid, hook_error)
+        # 发请求
+        # 请求失败框架没有任何重试策略，只能靠openai SDK层兜底
+        # 网络抖动/ 429 / SDK内部重试2次，还失败抛异常，框架接住直接返回错误，不重试。
+        try:
+            response = self.client.chat.completions.create(**self.chat_params)
+        except Exception as e:
+            self._complete_model_request(error=e)       # 补一条trace
+            error_msg = format_lightagent_error(e, "create chat completion")  # 格式化错误
+            self.log("ERROR", "model_request_failed", {"error": error_msg})   # 记日志
+            self._record_trace("error", {"stage": "model_request", "error": error_msg})  # 记trace
+            self._finish_run(success=False, error=error_msg, stage="model_request")     # 收尾
+            if stream:
+                stream_result = self._error_stream(error_msg)
+                if result_format == "event":
+                    return self._stream_as_events(stream_result, traceid)
+                return stream_result
+            return self._format_run_result(error_msg, result_format, traceid, error_msg)
+        self._complete_model_request(response=response)
+
+        result = self._core_run_logic(response, stream, max_retry, effective_max_tool_iterations)
+        if stream:
+            if result_format == "event":
+                return self._stream_as_events(result, traceid)
+            return result
+        return self._format_run_result(result, result_format, traceid)
+
+    async def arun(self, query: str, **kwargs: Any) -> Any:
+        """Run without blocking the caller's event loop.
+
+        Sync model and tool clients are isolated in a worker thread for v0.9
+        compatibility. Native async Providers and Jobs remain on the caller's
+        event loop through ``CapabilityRegistry`` and ``AgentRuntime``.
+        """
+        stream = bool(kwargs.get("stream", False))
+        if not stream:
+            return await asyncio.to_thread(self.run, query, **kwargs)
+        return self.astream(query, **kwargs)
+
+    async def astream(self, query: str, **kwargs: Any) -> AsyncGenerator[Any, None]:
+        """Expose the legacy streaming generator as a cancellable async iterator."""
+        options = dict(kwargs)
+        options["stream"] = True
+        stream_result = await asyncio.to_thread(self.run, query, **options)
+        sentinel = object()
+        try:
+            while True:
+                chunk = await asyncio.to_thread(next, stream_result, sentinel)
+                if chunk is sentinel:
+                    return
+                yield chunk
+        finally:
+            close = getattr(stream_result, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
+
+    def get_session(self, session_id: str | None = None) -> Session | None:
+        """Return a detached copy of the current or requested Session."""
+        resolved = session_id or self._current_session_id
+        return self.runtime.session_store.get(resolved) if resolved else None
+
+    def export_session(self, session_id: str | None = None) -> Dict[str, Any]:
+        session = self.get_session(session_id)
+        if session is None:
+            raise KeyError(session_id or "current session")
+        return session.to_dict()
+
+    def replay_session(self, session_id: str | None = None) -> Dict[str, Any]:
+        session = self.get_session(session_id)
+        if session is None:
+            raise KeyError(session_id or "current session")
+        return session.replay().to_dict()
+
+    def checkpoint_session(
+            self,
+            label: str | None = None,
+            metadata: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        return self.runtime.checkpoint(label, metadata).to_dict()
+
+    def fork_session(
+            self,
+            *,
+            through_sequence: int | None = None,
+            metadata: Dict[str, Any] | None = None,
+    ) -> Session:
+        return self.runtime.fork(through_sequence=through_sequence, metadata=metadata)
+
+    def compact_session(
+            self,
+            *,
+            max_messages: int = 20,
+            session_id: str | None = None,
+    ) -> Dict[str, Any]:
+        session = self.get_session(session_id)
+        if session is None:
+            raise KeyError(session_id or "current session")
+        result = self.context_compactor.compact(ContextProjector().messages(session), max_messages=max_messages)
+        target = self.runtime.session if self.runtime.session and self.runtime.session.session_id == session.session_id else session
+        target.append("context.compacted", {
+            "messages": result.messages,
+            "removed_count": result.removed_count,
+            "summary": result.summary,
+            "spilled": result.spilled,
+        })
+        self.runtime.session_store.save(target)
+        return {
+            "messages": result.messages,
+            "removed_count": result.removed_count,
+            "summary": result.summary,
+            "spilled": result.spilled,
+        }
+
+    def pause_session(self, reason: str | None = None) -> None:
+        self._record_session_event("session.paused", {"reason": reason})
+
+    def resume_session(self, reason: str | None = None) -> None:
+        self._record_session_event("session.resumed", {"reason": reason})
+
+    def cancel_session(self, reason: str | None = None) -> None:
+        self._record_session_event("session.cancelled", {"reason": reason})
+
+    async def invoke_capability(self, capability: str, **arguments: Any) -> Any:
+        """Invoke one registered capability through Policy and audit."""
+        return await self.capability_registry.invoke(
+            capability,
+            arguments,
+            context=self.runtime.context,
+        )
+
+    def _begin_session_run(
+            self,
+            *,
+            session_id: str | None,
+            query: str,
+            user_id: str,
+            metadata: Dict[str, Any],
+            stream: bool,
+    ) -> List[Dict[str, Any]]:
+        self.runtime.open_session(
+            session_id,
+            metadata=metadata,
+            agent_id=self.name,
+            user_id=user_id,
+        )
+        current = self.runtime.session
+        # 翻译成messages
+        # message.received -> {"role": "user", ...}
+        # assistant.completed -> {"role": "assistant", ...}
+        # tool.completed -> {"role": "tool", ...}
+        # budget.consumed、policy.decision、turn.started… 跳过
+        projected = ContextProjector().messages(current) if current is not None else []
+        self._current_session_id = current.session_id if current is not None else None
+        self._current_turn_id = uuid4().hex
+        self._session_turn_finished = False
+        self._session_store_error = None
+        self.runtime.context.turn_id = self._current_turn_id
+        self.runtime.context.run_id = self._current_run_id
+        self.runtime.context.metadata = deepcopy(metadata)
+        self._record_session_event("turn.started", {
+            "query": query,
+            "stream": stream,
+            "trace_id": self.traceid,
+        })
+        self._record_session_event("message.received", {"role": "user", "content": query})
+        return projected
+
+    def _register_builtin_providers(self) -> None:
+        existing = {item["name"] for item in self.capability_registry.list()}
+        if "tools" not in existing:
+            self.capability_registry.register(ToolProviderAdapter(self.tool_registry), scope=CapabilityScope.RUNTIME)
+        if self.memory is not None and "memory" not in existing:
+            self.capability_registry.register(MemoryProviderAdapter(self.memory), scope=CapabilityScope.RUNTIME)
+
+    def _record_session_event(self, event_type: str, data: Dict[str, Any] | None = None) -> Any:
+        if not getattr(self, "runtime", None) or self.runtime.session is None:
+            return None
+        try:
+            session = self.runtime.session
+            event = session.append(
+                event_type,
+                data or {},
+                turn_id=getattr(self, "_current_turn_id", None),
+                run_id=getattr(self, "_current_run_id", None),
+                agent_id=self.name,
+            )
+            self.runtime.session_store.save(session)
+            return event
+        except Exception as error:
+            self._session_store_error = f"{type(error).__name__}: {error}"
+            self.log("ERROR", "session_store_error", {"error": self._session_store_error})
+            return None
+
+    def _record_trace(self, event_type: str, data: Dict[str, Any] | None = None):
+        """Record compatible Trace and durable Session views from one event."""
+        trace_data = deepcopy(data or {})
+        session_type = {
+            "run_start": "run.started",
+            "model_request": "model.requested",
+            "model_response": "assistant.completed",
+            "tool_call": "tool.requested",
+            "tool_result": "tool.completed",
+            "guardrail_block": "policy.blocked",
+            "hook_block": "policy.blocked",
+            "error": "error.recorded",
+            "handoff": "handoff.requested",
+            "run_end": "run.completed" if trace_data.get("success") else "run.failed",
+        }.get(event_type, "trace.recorded")
+        session_data = {
+            **trace_data,
+            "trace_type": event_type,
+            "trace_data": trace_data,
+            "trace_id": getattr(self, "traceid", None),
+            "parent_trace_id": getattr(self, "_parent_trace_id", None),
+            "run_group_id": getattr(self, "_run_group_id", None),
+        }
+        if event_type == "model_request":
+            session_data["messages"] = deepcopy(getattr(self, "chat_params", {}).get("messages", []))
+        self._record_session_event(session_type, session_data)
+        recorder = getattr(self, "_trace_recorder", None)
+        if recorder:
+            return recorder.record(event_type, trace_data)
+        return None
+
+    def _run_hooks(
+            self,
+            phase: str,
+            payload: Dict[str, Any] | None = None,
+            *,
+            step_name: str | None = None,
+            flow_id: str | None = None,
+    ) -> HookDecision:
+        """Run configured hooks and mirror decisions into trace events."""
+        context = HookContext(
+            phase=phase,
+            payload=payload or {},
+            trace_id=self.traceid or None,
+            parent_trace_id=getattr(self, "_parent_trace_id", None),
+            run_id=getattr(self, "_current_run_id", None),
+            run_group_id=getattr(self, "_run_group_id", None),
+            user_id=getattr(self, "_current_user_id", None),
+            agent_name=self.name,
+            flow_id=flow_id,
+            step_name=step_name,
+            metadata=deepcopy(getattr(self, "_current_run_metadata", {})),
+        )
+        decision = self.hooks.run(context)
+        for event in decision.metadata.get("hook_events", []) if decision.metadata else []:
+            self._record_trace("hook_decision", event)
+        for event in decision.metadata.get("review_events", []) if decision.metadata else []:
+            event_data = dict(event)
+            event_type = str(event_data.pop("type", "approval_decision"))
+            self._record_trace(event_type, event_data)
+        if decision.action == HOOK_BLOCK:
+            self._record_trace("hook_block", {"phase": phase, "reason": decision.reason})
+        return decision
+
+    def _record_policy_adapter_event(
+            self,
+            phase: str,
+            adapter: str,
+            action: str,
+            *,
+            reason: str | None = None,
+            metadata: Dict[str, Any] | None = None,
+    ) -> None:
+        event = {
+            "phase": phase,
+            "hook": adapter,
+            "action": action,
+            "adapter": True,
+        }
+        if reason:
+            event["reason"] = reason
+        if metadata:
+            event.update(metadata)
+        self._record_trace("hook_decision", event)
+
+    def _finish_run(
+            self,
+            *,
+            success: bool,
+            content: Any = None,
+            error: str | None = None,
+            stage: str | None = None,
+            extra: Dict[str, Any] | None = None,
+    ) -> HookDecision:
+        """Close a run with on_error/after_run hooks and a run_end trace event."""
+        started_at = getattr(self, "_run_started_at", None)
+        duration_seconds = (time.perf_counter() - started_at) if started_at is not None else 0.0
+        budget_error = getattr(self, "_budget_error", None)
+        if budget_error:
+            success = False
+            error = error or budget_error
+            stage = stage or "budget"
+        try:
+            if duration_seconds:
+                self.runtime.budget.consume(seconds=duration_seconds)
+        except BudgetExceeded as exceeded:
+            success = False
+            error = error or format_error_code("LA-BUDGET", str(exceeded))
+            stage = stage or "budget"
+        payload = {
+            "success": success,
+            "content": content,
+            "error": error,
+            "stage": stage,
+        }
+        if extra:
+            payload.update(extra)
+        if not success:
+            self._run_hooks("on_error", payload)
+        decision = self._run_hooks("after_run", payload)
+        if decision.payload:
+            if "content" in decision.payload:
+                content = decision.payload["content"]
+            if "error" in decision.payload:
+                error = decision.payload["error"]
+        run_end = {"success": success}
+        if error is not None:
+            run_end["error"] = error
+        if stage is not None:
+            run_end["stage"] = stage
+        if extra:
+            run_end.update(extra)
+        if started_at is not None:
+            run_end["duration_ms"] = round((time.perf_counter() - started_at) * 1000, 3)
+        run_end["model_request_count"] = int(getattr(self, "_model_request_count", 0))
+        run_end["tool_call_count"] = len(getattr(self, "_current_tool_calls", []))
+        run_end["retry_count"] = int(getattr(self, "_retry_count", 0))
+        usage = normalize_usage(getattr(self, "_current_usage", None))
+        if usage:
+            run_end["usage"] = usage
+        self._record_trace("run_end", run_end)
+        if not getattr(self, "_session_turn_finished", True):
+            self._record_session_event("turn.completed" if success else "turn.failed", {
+                **run_end,
+                "content": content,
+            })
+            self._session_turn_finished = True
+        return decision
+
+    def _notify_error(self, *, stage: str, error: str, **payload: Any) -> HookDecision:
+        """Notify error hooks for recoverable or non-terminal runtime errors."""
+        data = {"stage": stage, "error": error}
+        data.update(payload)
+        return self._run_hooks("on_error", data)
+
+    @staticmethod
+    def _format_hook_error(phase: str, reason: str | None = None) -> str:
+        details = {"phase": phase}
+        if reason:
+            details["reason"] = reason
+        return format_error_code("LA-HOOK", details)
+
+    def _current_cancellation_error(self, stage: str) -> str | None:
+        token = getattr(self, "_current_cancellation_token", None)
+        if token is None or not token.cancelled:
+            return None
+        return format_error_code("LA-CANCELLED", {
+            "stage": stage,
+            "reason": token.reason or "cancellation requested",
+            "token_id": token.token_id,
+        })
+
+    # 发请求前的最后一道检查和记账
+    def _prepare_model_request(self) -> str | None:
+        # 检查外部取消，取消就返回错误
+        cancellation_error = self._current_cancellation_error("before_model_request")
+        if cancellation_error:
+            return cancellation_error
+        # Context compactor默认关闭。开启后可以在这里把过长的历史压掉
+        self._compact_model_context()
+        # 跑钩子，钩子能改整个请求参数
+        decision = self._run_hooks("before_model_request", {"params": deepcopy(self.chat_params)})
+        if decision.action == HOOK_BLOCK:
+            return self._format_hook_error("before_model_request", decision.reason)
+        if decision.payload:
+            params = decision.payload.get("params", decision.payload)
+            if isinstance(params, dict):
+                self.chat_params = params
+        # 扣预算，每次模型调用都扣一次，预算耗尽直接拦住
+        try:
+            self.runtime.budget.consume(model_calls=1)
+        except BudgetExceeded as error:
+            return format_error_code("LA-BUDGET", str(error))
+        # 计数 + trace + 计时
+        self._model_request_count = int(getattr(self, "_model_request_count", 0)) + 1
+        request_data = self._build_model_request_trace(self.chat_params)
+        # request_index就是第几次模型请求。一次多轮工具调用会产生多条model_request事件，靠它区分
+        request_data["request_index"] = self._model_request_count
+        self._pending_model_trace_event = self._record_trace("model_request", request_data)
+        self._pending_model_started_at = time.perf_counter()
+        return None
+
+    def _compact_model_context(self) -> None:
+        messages = self.chat_params.get("messages", [])
+        if not self.context_budget or self.context_budget.fits(messages):
+            return
+        compacted = self.context_compactor.compact_to_budget(messages, self.context_budget)
+        self.chat_params["messages"] = compacted.messages
+        self._record_session_event("context.compacted", {
+            "removed_count": compacted.removed_count,
+            "summary": compacted.summary,
+            "spilled": compacted.spilled,
+            "estimated_tokens": self.context_budget.estimate(compacted.messages),
+        })
+
+    def _complete_model_request(
+            self,
+            *,
+            response: Any = None,
+            error: BaseException | None = None,
+    ) -> None:
+        """Attach latency, usage, and outcome metadata to the request trace."""
+        event = getattr(self, "_pending_model_trace_event", None)
+        started_at = getattr(self, "_pending_model_started_at", None)
+        latency_ms = None
+        if started_at is not None:
+            latency_ms = round((time.perf_counter() - started_at) * 1000, 3)
+
+        usage = normalize_usage(getattr(response, "usage", None))
+        if usage:
+            self._accumulate_usage(usage)
+        if event is not None:
+            if latency_ms is not None:
+                event.data["latency_ms"] = latency_ms
+            event.data["success"] = error is None
+            if usage:
+                event.data["usage"] = usage
+            if error is not None:
+                event.data["error_type"] = error.__class__.__name__
+        self._record_session_event("model.failed" if error is not None else "model.completed", {
+            "request_index": int(getattr(self, "_model_request_count", 0)),
+            "latency_ms": latency_ms,
+            "usage": usage,
+            "error_type": error.__class__.__name__ if error is not None else None,
+        })
+        if usage:
+            try:
+                self.runtime.budget.consume(tokens=int(usage.get("total_tokens", 0)))
+            except BudgetExceeded as exceeded:
+                self._budget_error = format_error_code("LA-BUDGET", str(exceeded))
+        self._last_model_trace_event = event
+        self._pending_model_trace_event = None
+        self._pending_model_started_at = None
+
+    def _accumulate_usage(self, usage: Any) -> None:
+        normalized = normalize_usage(usage)
+        if not normalized:
+            return
+        totals = getattr(self, "_usage_totals", {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        })
+        for key in totals:
+            totals[key] += normalized.get(key, 0)
+        self._usage_totals = totals
+        self._current_usage = dict(totals)
+
+    def export_trace(self) -> List[Dict[str, Any]]:
+        """Return structured trace events from the most recent run."""
+        recorder = getattr(self, "_trace_recorder", None)
+        if not recorder:
+            return []
+        return recorder.to_list()
+
+    def summarize_trace(self, *, pricing: Dict[str, float] | None = None):
+        """Return aggregate metrics for the most recent trace."""
+        return summarize_trace(
+            self.export_trace(),
+            usage=getattr(self, "_current_usage", None),
+            pricing=pricing,
+        )
+
+    def export_trace_to(
+            self,
+            exporter: Any,
+            *,
+            pricing: Dict[str, float] | None = None,
+            metadata: Dict[str, Any] | None = None,
+    ) -> Any:
+        """Send the most recent trace to a callable or TraceExporter."""
+        return export_trace(
+            self.export_trace(),
+            exporter,
+            usage=getattr(self, "_current_usage", None),
+            pricing=pricing,
+            metadata=metadata,
+        )
+
+    def _build_model_request_trace(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a prompt-safe summary of a model request for trace events."""
+        tools = []
+        for tool in params.get("tools", []) or []:
+            tools.append(tool.get("function", {}).get("name", str(tool)))
+        return {
+            "model": params.get("model"),
+            "stream": bool(params.get("stream")),
+            "message_count": len(params.get("messages", [])),
+            "tools": tools,
+        }
+
+    @staticmethod
+    def _format_guardrail_error(stage: str, reason: str | None = None) -> str:
+        details = {"stage": stage}
+        if reason:
+            details["reason"] = reason
+        return format_error_code("LA-GUARDRAIL", details)
+
+    # 允许时可以取回改写后的 arguments；拦截时返回 (arguments, LA-GUARDRAIL 错误)。
+    def _apply_tool_guardrails(self, tool_name: str, arguments: Dict[str, Any]) -> tuple[Dict[str, Any], str | None]:
+        decision = self.guardrails.check_tool(tool_name, arguments, {
+            "agent_name": self.name,
+            "trace_id": self.traceid,
+        })
+        if decision.allowed:
+            if isinstance(decision.value, dict):
+                updated_arguments = decision.value.get("arguments", arguments)
+                if isinstance(updated_arguments, dict) and updated_arguments != arguments:
+                    self._record_policy_adapter_event(
+                        "before_tool_call",
+                        "tool_guardrails",
+                        "replace",
+                        metadata={"tool": tool_name},
+                    )
+                    return updated_arguments, None
+            return arguments, None
+        error_msg = self._format_guardrail_error("tool", decision.reason)
+        self._record_policy_adapter_event(
+            "before_tool_call",
+            "tool_guardrails",
+            "block",
+            reason=decision.reason,
+            metadata={"tool": tool_name},
+        )
+        self._record_trace("guardrail_block", {
+            "stage": "tool",
+            "tool": tool_name,
+            "reason": decision.reason,
+        })
+        return arguments, error_msg
+
+    # 四步：1.工具被允许吗？需要审批吗？2.tool_calls += 1 3. 参数合规吗？ 4. before_tool_call 钩子 → 最后一道可改写
+    def _prepare_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> tuple[Dict[str, Any], str | None]:
+        cancellation_error = self._current_cancellation_error("before_tool_call")
+        if cancellation_error:
+            return arguments, cancellation_error
+        spec = CapabilitySpec(
+            name=f"tool.{tool_name}",
+            description=str(self.tool_registry.function_info.get(tool_name, {}).get("tool_description", "")),
+            execute=True,
+            risk=CapabilityRisk.SENSITIVE,
+            cancellable=True,
+            requires_sandbox=is_unsafe_python_tool(
+                tool_name, self.tool_registry.function_mappings.get(tool_name),
+            ),
+        )
+        if spec.requires_sandbox:
+            reason = UNSAFE_PYTHON_TOOL_REASON
+            self._record_session_event("policy.decision", {
+                "provider": "tools",
+                "capability": spec.name,
+                "allowed": False,
+                "requires_sandbox": True,
+                "reason": reason,
+            })
+            return arguments, format_error_code("LA-SANDBOX", reason)
+        policy_decision = self.capability_registry.policy_engine.evaluate_sync(PolicyRequest(
+            capability=spec,
+            provider_name="tools",
+            arguments=deepcopy(arguments),
+            context=self.runtime.context,
+        ))
+        self._record_session_event("policy.decision", {
+            "provider": "tools",
+            "capability": spec.name,
+            "allowed": policy_decision.allowed,
+            "requires_approval": policy_decision.requires_approval,
+            "reason": policy_decision.reason,
+        })
+        if not policy_decision.allowed:
+            state = "requires approval" if policy_decision.requires_approval else "was denied"
+            return arguments, format_error_code(
+                "LA-POLICY",
+                f"capability `{spec.name}` {state}: {policy_decision.reason or 'policy decision'}",
+            )
+        if policy_decision.arguments is not None:
+            arguments = policy_decision.arguments
+        try:
+            self.runtime.budget.consume(tool_calls=1)
+        except BudgetExceeded as error:
+            # 预算超限是硬边界：置终止标志，由主循环结束整轮，
+            # 不再把错误当成普通工具结果继续让模型试。
+            self._budget_error = format_error_code("LA-BUDGET", str(error))
+            return arguments, self._budget_error
+        arguments, guardrail_error = self._apply_tool_guardrails(tool_name, arguments)    # 护栏先查
+        if guardrail_error:
+            return arguments, guardrail_error
+
+        decision = self._run_hooks("before_tool_call", {         # 钩子后改
+            "tool_name": tool_name,
+            "arguments": dict(arguments),
+        })
+        if decision.action == HOOK_BLOCK:
+            return arguments, self._format_hook_error("before_tool_call", decision.reason)
+        if decision.payload:
+            updated_arguments = decision.payload.get("arguments", arguments)
+            if isinstance(updated_arguments, dict):
+                return updated_arguments, None
+        return arguments, None
+
+    def _apply_after_tool_result(self, tool_name: str, output: Any) -> Any:
+        decision = self._run_hooks("after_tool_result", {
+            "tool_name": tool_name,
+            "output": output,
+        })
+        if decision.action == HOOK_BLOCK:
+            return self._format_hook_error("after_tool_result", decision.reason)
+        if decision.payload and "output" in decision.payload:
+            return decision.payload["output"]
+        return output
+
+    def _apply_output_guardrails(self, output: str) -> str:
+        """护栏检查模型原始输出：钩子的改写不改变判定对象"""
+        original_output = output
+
+        hook_decision = self._run_hooks("after_model_response", {"content": output})     # 钩子先
+        if hook_decision.action == HOOK_BLOCK:                                  # 钩子要拦，返回错误串
+            return self._format_hook_error("after_model_response", hook_decision.reason)
+        if hook_decision.payload and "content" in hook_decision.payload:        # 钩子要改，替换output
+            output = str(hook_decision.payload["content"])                                             # 钩子改写生效
+        decision = self.guardrails.check_output(original_output, {                                       # 护栏后
+            "agent_name": self.name,
+            "trace_id": self.traceid,
+        })
+        if not decision.allowed:
+            error_msg = self._format_guardrail_error("output", decision.reason)
+            self._record_policy_adapter_event(
+                "after_model_response",
+                "output_guardrails",
+                "block",
+                reason=decision.reason,
+            )
+            self._record_trace("guardrail_block", {"stage": "output", "reason": decision.reason})
+            return error_msg
+        if decision.value is not None:                                      # 护栏要改，返回新值
+            if str(decision.value) != output:
+                self._record_policy_adapter_event("after_model_response", "output_guardrails", "replace")
+            return str(decision.value)                                                                  # 护栏改写生效
+        return output
+
+    def _process_runtime_tools(self, tools: List[Union[str, Callable]]) -> List[Dict]:
+        """
+        处理运行时传入的工具，返回OpenAI格式的工具描述给模型看
+
+        :param tools: 运行时传入的工具列表
+        :return: OpenAI格式的工具描述列表
+        """
+        '''临时建一个注册表，要单独拿到这次新增的工具列表。直接用主注册表可能里面有构造时的旧工具'''
+        temp_registry = ToolRegistry()
+
+        for tool in tools:
+            if isinstance(tool, str):
+                try:
+                    tool_func = self.tool_loader.load_tool(tool)    # 从文件加载，比如传的是'get_weather'字符串
+                    if temp_registry.register_tool(tool_func):      # 登记1次，收集这次的schema返回给模型
+                        self.tool_registry.register_tool(tool_func)     # 登记2次，登记到主注册表
+                        self.loaded_tools[tool_func.tool_info["tool_name"]] = tool_func     # 登记3次，登记到名字表
+                except Exception as e:
+                    self.log("ERROR", "load_runtime_tool", {"tool": tool, "error": str(e)})
+            elif callable(tool) and hasattr(tool, "tool_info"):     # 直接就是函数，比如get_weather，检查有没有"tool_info"
+                if temp_registry.register_tool(tool):
+                    self.tool_registry.register_tool(tool)
+                    self.loaded_tools[tool.tool_info["tool_name"]] = tool
+
+        # 返回schema列表，get_tools() 返回的是 deepcopy(self.openai_function_schemas)
+        runtime_tools = temp_registry.get_tools()
+        # 因为主注册表变了，执行器要重新绑定
+        self.tool_dispatcher = AsyncToolDispatcher(self.tool_registry.function_mappings, self.tool_registry.function_info)
+        self.log("DEBUG", "runtime_tools_processed", {"count": len(runtime_tools)})
+        return runtime_tools
+
+    def _format_run_result(
+            self,
+            content: Any,
+            result_format: str,
+            trace_id: str,
+            error: str | None = None,
+    ) -> Union[str, RunResult, Dict[str, Any]]:
+        """把内层产出的内容包装成调用方想要的样子"""
+        """Format the final non-streaming response while preserving legacy defaults."""
+        text = "" if content is None else str(content)
+        detected_error = error
+        if detected_error is None and is_error_text(text):
+            detected_error = text
+
+        if result_format == "str":
+            return text
+
+        result = RunResult(
+            content=text,
+            reasoning_content=getattr(self, "_current_reasoning_content", "") or None,
+            tool_calls=deepcopy(getattr(self, "_current_tool_calls", [])),
+            usage=deepcopy(getattr(self, "_current_usage", None)),
+            trace_id=trace_id,
+            trace=self.export_trace(),
+            error=detected_error,
+        )
+        if result_format == "dict":
+            return {
+                "content": result.content,
+                "reasoning_content": result.reasoning_content,
+                "tool_calls": result.tool_calls,
+                "usage": result.usage,
+                "trace_id": result.trace_id,
+                "trace": result.trace,
+                "error": result.error,
+            }
+        return result       # result_format="object"（或者任何其他值）走这条。
+
+    # 流式默认 yield 的是裸 chunk（字符串、字典）。result_format="event" 时，这个函数把它们包装成 StreamEvent。
+    def _stream_as_events(self, stream_result: Generator[Any, None, None], trace_id: str) -> Generator[StreamEvent, None, None]:
+        """Wrap legacy stream chunks as structured events when explicitly requested."""
+        for chunk in stream_result:
+            if isinstance(chunk, dict):
+                if "error" in chunk:
+                    yield StreamEvent(type="error", data=chunk, trace_id=trace_id)
+                elif "output" in chunk:
+                    yield StreamEvent(type="tool_result", data=chunk, trace_id=trace_id)
+                elif "name" in chunk and "arguments" in chunk:
+                    yield StreamEvent(type="tool_call", data=chunk, trace_id=trace_id)
+                else:
+                    yield StreamEvent(type="event", data=chunk, trace_id=trace_id)
+            elif is_error_text(chunk):
+                yield StreamEvent(type="error", data=chunk, trace_id=trace_id)
+            else:
+                yield StreamEvent(type="content", data=chunk, trace_id=trace_id)
+
+    '''检索相关记忆，拼在问题前面；顺手把这次问题也存进去，后果就是失败的请求垃圾数据也会占用空间'''
+    '''1.检索当前记忆 2.拼进context 3.把当前的query存进记忆 4.返回拼好的字符串 5.run()继续'''
+    def _add_memory_context(self, query: str, user_id: str) -> str:
+        """添加记忆上下文"""
+        if self.memory is None:
+            return query
+
+        context = ""
+        memory_user_id = self.memory_policy.scoped_user_id(user_id)
+        related_memories = self._retrieve_memory_with_hooks(
+            query=query,
+            memory_user_id=memory_user_id,
+            original_user_id=user_id,
+            source="user",
+            scope="user",       # 表示这条记忆属于user
+        )
+        if related_memories and related_memories.get("results"):     # 检索结果是字典，result是列表，每条有memory字段
+            context += "\n##用户偏好\n用户之前提到了:\n" + "\n".join(
+                [m["memory"] for m in related_memories["results"]]
+            )
+        self._store_memory_with_policy(         # 把当前问题存进记忆
+            data=query,
+            memory_user_id=memory_user_id,
+            original_user_id=user_id,
+            source="user",
+            scope="user",
+        )
+
+        if self.self_learning:      # agent自我学习，额外检索一份"agent 自己积累的经验"，拼在"用户偏好"后面。
+            agent_user_id = self.memory_policy.scoped_user_id(self.name)
+            agent_memories = self._retrieve_memory_with_hooks(
+                query=query,
+                memory_user_id=agent_user_id,
+                original_user_id=self.name,
+                source="reflection",
+                scope="agent",
+            )
+            if agent_memories and agent_memories.get("results"):
+                context += "\n##问题相关补充信息:\n" + "\n".join(
+                    [m["memory"] for m in agent_memories["results"]]
+                )
+            self._store_memory_with_policy(
+                data=query,
+                memory_user_id=agent_user_id,
+                original_user_id=self.name,
+                source="reflection",
+                scope="agent",
+            )
+        '''因为记忆和问题被拼成了一条 user 消息，模型需要区分哪部分是"参考资料"、哪部分是"要回答的"。
+           '##用户提问'这个标记就是分隔符。不加的话，模型可能把记忆里的内容当成要回答的问题。
+        '''
+        return f"{context}\n##用户提问：\n{query}" if context else query
+
+    '''_retrieve_memory_with_hooks是同步调用，接了向量数据库，每次run都会阻塞等待检索结果'''
+    def _retrieve_memory_with_hooks(
+            self,
+            *,
+            query: str,
+            memory_user_id: str,
+            original_user_id: str,
+            source: str,
+            scope: str,
+    ) -> Any:
+        """Retrieve memories through hook and MemoryPolicy boundaries."""
+        before = self._run_hooks("before_memory_retrieve", {
+            "query": query,
+            "memory_user_id": str(memory_user_id),
+            "original_user_id": str(original_user_id),
+            "source": source,
+            "scope": scope,
+        })
+        if before.action == HOOK_BLOCK:
+            self._record_trace("memory_retrieve_block", {
+                "reason": before.reason,
+                "source": source,
+                "scope": scope,
+                "user_id": str(original_user_id),
+            })
+            return {"results": []}
+        if before.payload:
+            query = str(before.payload.get("query", query))
+            memory_user_id = str(before.payload.get("memory_user_id", memory_user_id))
+
+        memories = self.memory.retrieve(query=query, user_id=memory_user_id)
+        after = self._run_hooks("after_memory_retrieve", {
+            "query": query,
+            "memory_user_id": str(memory_user_id),
+            "original_user_id": str(original_user_id),
+            "source": source,
+            "scope": scope,
+            "memories": memories,
+        })
+        if after.action == HOOK_BLOCK:
+            self._record_trace("memory_retrieve_block", {
+                "reason": after.reason,
+                "source": source,
+                "scope": scope,
+                "user_id": str(original_user_id),
+            })
+            return {"results": []}
+        if after.payload and "memories" in after.payload:
+            memories = after.payload["memories"]
+
+        return self._filter_memory_results(memories, memory_user_id, original_user_id)
+
+    def _store_memory_with_policy(
+            self,
+            *,
+            data: str,
+            memory_user_id: str,
+            original_user_id: str,
+            source: str,
+            scope: str,
+    ) -> bool:
+        """Persist memory only when the configured memory policy allows it."""
+        if self.memory is None:
+            return False
+        context = {
+            "agent_name": self.name,
+            "trace_id": self.traceid,
+            "parent_trace_id": getattr(self, "_parent_trace_id", None),
+            "run_id": getattr(self, "_current_run_id", None),
+            "run_group_id": getattr(self, "_run_group_id", None),
+            "user_id": str(original_user_id),
+            "memory_user_id": str(memory_user_id),
+            "source": source,
+            "scope": scope,
+        }
+        hook_decision = self._run_hooks("before_memory_write", {
+            "data": data,
+            "memory_user_id": str(memory_user_id),
+            "original_user_id": str(original_user_id),
+            "source": source,
+            "scope": scope,
+        })
+        if hook_decision.action == HOOK_BLOCK:
+            self._record_trace("memory_write_block", {
+                "reason": hook_decision.reason,
+                "source": source,
+                "scope": scope,
+                "user_id": str(original_user_id),
+            })
+            return False
+        if hook_decision.payload:
+            data = str(hook_decision.payload.get("data", data))
+        decision = self.memory_policy.allows_write(
+            data,
+            context,
+            write_count=getattr(self, "_memory_write_count", 0),
+            recent_fingerprints=getattr(self, "_memory_write_fingerprints", set()),
+        )
+        if not decision.allowed:
+            self._record_policy_adapter_event(
+                "before_memory_write",
+                "memory_write_admission",
+                "block",
+                reason=decision.reason,
+                metadata={"source": source, "scope": scope},
+            )
+            self._record_trace("memory_write_block", {
+                "reason": decision.reason,
+                "source": source,
+                "scope": scope,
+                "user_id": str(original_user_id),
+            })
+            return False
+
+        stored_data = decision.value if decision.value is not None else data
+        if decision.value is not None and decision.value != data:
+            self._record_policy_adapter_event(
+                "before_memory_write",
+                "memory_write_admission",
+                "replace",
+                metadata={"source": source, "scope": scope},
+            )
+        metadata = MemoryScope(
+            source=source,
+            scope=scope,
+            agent_name=self.name,
+            trace_id=self.traceid,
+            parent_trace_id=getattr(self, "_parent_trace_id", None),
+            metadata={
+                "user_id": str(memory_user_id),
+                "original_user_id": str(original_user_id),
+                "run_id": getattr(self, "_current_run_id", None),
+                "run_group_id": getattr(self, "_run_group_id", None),
+            },
+        ).to_metadata()
+        if self._requires_memory_promotion(source=source, scope=scope):
+            return self._handle_memory_promotion_candidate(
+                data=stored_data,
+                memory_user_id=memory_user_id,
+                original_user_id=original_user_id,
+                source=source,
+                scope=scope,
+                metadata=metadata,
+                context=context,
+            )
+
+        self._store_memory_record(stored_data, memory_user_id, metadata)
+        self._run_hooks("after_memory_write", {
+            "data": stored_data,
+            "metadata": metadata,
+            "memory_user_id": str(memory_user_id),
+            "original_user_id": str(original_user_id),
+            "source": source,
+            "scope": scope,
+        })
+        self._memory_write_count = getattr(self, "_memory_write_count", 0) + 1
+        fingerprints = getattr(self, "_memory_write_fingerprints", set())
+        fingerprints.add(self.memory_policy.write_fingerprint(stored_data, context))
+        self._memory_write_fingerprints = fingerprints
+        self._record_trace("memory_write", {
+            "source": source,
+            "scope": scope,
+            "user_id": str(original_user_id),
+        })
+        return True
+
+    def _requires_memory_promotion(self, *, source: str, scope: str) -> bool:
+        """Return whether a memory write must pass explicit promotion first."""
+        if not self.memory_policy.require_promotion_for_internal_memory:
+            return False
+        internal_sources = {
+            "reflection",
+            "delegation",
+            "self_learning",
+            "agent",
+            "derived",
+            "swarm",
+            "trace",
+            "tool",
+        }
+        internal_scopes = {"agent", "delegation", "shared", "internal", "swarm", "flow"}
+        return str(source).lower() in internal_sources or str(scope).lower() in internal_scopes
+
+    def _handle_memory_promotion_candidate(
+            self,
+            *,
+            data: str,
+            memory_user_id: str,
+            original_user_id: str,
+            source: str,
+            scope: str,
+            metadata: dict[str, Any],
+            context: dict[str, Any],
+    ) -> bool:
+        """Review an internal memory candidate before it can be persisted."""
+        candidate = MemoryCandidate(
+            data=str(data),
+            memory_user_id=str(memory_user_id),
+            original_user_id=str(original_user_id),
+            source=source,
+            scope=scope,
+            agent_name=self.name,
+            trace_id=self.traceid,
+            parent_trace_id=getattr(self, "_parent_trace_id", None),
+            run_id=getattr(self, "_current_run_id", None),
+            run_group_id=getattr(self, "_run_group_id", None),
+            metadata=dict(metadata),
+        )
+        self._upsert_memory_candidate(candidate)
+        self._record_trace("memory_promotion_required", self._memory_candidate_trace(candidate))
+        promotion_context = {**context, "candidate_id": candidate.candidate_id}
+
+        hook_decision = self._run_hooks("before_memory_promote", {
+            "candidate": candidate.to_dict(include_data=True),
+            "data": candidate.data,
+            "memory_user_id": candidate.memory_user_id,
+            "original_user_id": candidate.original_user_id,
+            "source": candidate.source,
+            "scope": candidate.scope,
+        })
+        if hook_decision.action == HOOK_BLOCK:
+            blocked = candidate.with_updates(status="blocked")
+            self._upsert_memory_candidate(blocked)
+            self._record_trace("memory_promotion_blocked", {
+                **self._memory_candidate_trace(blocked),
+                "reason": hook_decision.reason,
+            })
+            return False
+        if hook_decision.payload:
+            candidate = self._candidate_from_hook_payload(candidate, hook_decision.payload)
+            self._upsert_memory_candidate(candidate)
+            payload_decision = hook_decision.payload.get("decision")
+            if payload_decision is not None:
+                promotion_decision = (
+                    payload_decision
+                    if isinstance(payload_decision, MemoryPromotionDecision)
+                    else self.memory_policy._coerce_promotion_decision(payload_decision, candidate.data)
+                )
+                return self._apply_memory_promotion_decision(candidate, promotion_decision, promotion_context)
+
+        promotion_decision = self.memory_policy.allows_promotion(candidate, promotion_context)
+        return self._apply_memory_promotion_decision(candidate, promotion_decision, promotion_context)
+
+    def _candidate_from_hook_payload(
+            self,
+            candidate: MemoryCandidate,
+            payload: dict[str, Any],
+    ) -> MemoryCandidate:
+        data = str(payload.get("data", candidate.data))
+        metadata = dict(candidate.metadata)
+        if isinstance(payload.get("metadata"), dict):
+            metadata.update(payload["metadata"])
+        if isinstance(payload.get("candidate"), dict):
+            candidate_payload = payload["candidate"]
+            data = str(candidate_payload.get("data", data))
+            if isinstance(candidate_payload.get("metadata"), dict):
+                metadata.update(candidate_payload["metadata"])
+        return candidate.with_updates(data=data, metadata=metadata)
+
+    def _apply_memory_promotion_decision(
+            self,
+            candidate: MemoryCandidate,
+            decision: MemoryPromotionDecision,
+            context: dict[str, Any],
+            *,
+            manual: bool = False,
+    ) -> bool:
+        """Apply a promotion decision and persist only explicitly promoted memory."""
+        if not decision.promotes:
+            status = "rejected" if decision.action == "reject" else "kept"
+            updated = candidate.with_updates(status=status, injectable=False)
+            self._upsert_memory_candidate(updated)
+            event_type = "memory_promotion_rejected" if decision.action == "reject" else "memory_promotion_blocked"
+            self._record_trace(event_type, {
+                **self._memory_candidate_trace(updated),
+                "decision": decision.action,
+                "reason": decision.reason,
+                "manual": manual,
+            })
+            return False
+
+        promoted_data = decision.value if decision.value is not None else candidate.data
+        promoted_metadata = candidate.to_metadata()
+        promoted_metadata.update(decision.metadata or {})
+        promoted_metadata.update({
+            "promotion_status": "promoted",
+            "promotion_decision": decision.action,
+            "injectable": True,
+            "promoted_at": datetime.utcnow().isoformat() + "Z",
+        })
+        promoted = candidate.with_updates(
+            data=str(promoted_data),
+            status="promoted",
+            injectable=True,
+            metadata=promoted_metadata,
+        )
+        self._store_memory_record(str(promoted_data), candidate.memory_user_id, promoted_metadata)
+        self._upsert_memory_candidate(promoted)
+
+        event_type = "memory_promotion_rewritten" if decision.action == "rewrite" else "memory_promotion_approved"
+        self._record_trace(event_type, {
+            **self._memory_candidate_trace(promoted),
+            "decision": decision.action,
+            "reason": decision.reason,
+            "manual": manual,
+        })
+        self._run_hooks("after_memory_promote", {
+            "candidate": promoted.to_dict(include_data=True),
+            "data": str(promoted_data),
+            "metadata": promoted_metadata,
+            "memory_user_id": candidate.memory_user_id,
+            "original_user_id": candidate.original_user_id,
+            "source": candidate.source,
+            "scope": candidate.scope,
+        })
+        self._run_hooks("after_memory_write", {
+            "data": str(promoted_data),
+            "metadata": promoted_metadata,
+            "memory_user_id": candidate.memory_user_id,
+            "original_user_id": candidate.original_user_id,
+            "source": candidate.source,
+            "scope": candidate.scope,
+        })
+
+        self._memory_write_count = getattr(self, "_memory_write_count", 0) + 1
+        fingerprints = getattr(self, "_memory_write_fingerprints", set())
+        fingerprints.add(self.memory_policy.write_fingerprint(str(promoted_data), context))
+        self._memory_write_fingerprints = fingerprints
+        self._record_trace("memory_write", {
+            "source": candidate.source,
+            "scope": candidate.scope,
+            "user_id": candidate.original_user_id,
+            "candidate_id": candidate.candidate_id,
+            "promotion_status": "promoted",
+        })
+        return True
+
+    def _memory_promotion_context(self, candidate: MemoryCandidate) -> dict[str, Any]:
+        return {
+            "agent_name": candidate.agent_name,
+            "trace_id": candidate.trace_id,
+            "parent_trace_id": candidate.parent_trace_id,
+            "run_id": candidate.run_id,
+            "run_group_id": candidate.run_group_id,
+            "user_id": candidate.original_user_id,
+            "memory_user_id": candidate.memory_user_id,
+            "source": candidate.source,
+            "scope": candidate.scope,
+            "candidate_id": candidate.candidate_id,
+        }
+
+    def _upsert_memory_candidate(self, candidate: MemoryCandidate) -> None:
+        candidates = list(getattr(self, "_memory_promotion_candidates", []))
+        for index, existing in enumerate(candidates):
+            if existing.candidate_id == candidate.candidate_id:
+                candidates[index] = candidate
+                self._memory_promotion_candidates = candidates
+                return
+        candidates.append(candidate)
+        self._memory_promotion_candidates = candidates
+
+    def _find_memory_candidate(self, candidate_id: str) -> MemoryCandidate | None:
+        for candidate in getattr(self, "_memory_promotion_candidates", []):
+            if candidate.candidate_id == str(candidate_id):
+                return candidate
+        return None
+
+    @staticmethod
+    def _memory_candidate_trace(candidate: MemoryCandidate) -> dict[str, Any]:
+        return {
+            "candidate_id": candidate.candidate_id,
+            "source": candidate.source,
+            "scope": candidate.scope,
+            "user_id": candidate.original_user_id,
+            "memory_user_id": candidate.memory_user_id,
+            "agent_name": candidate.agent_name,
+            "status": candidate.status,
+            "injectable": candidate.injectable,
+        }
+
+    def _store_memory_record(self, data: str, memory_user_id: str, metadata: dict[str, Any]) -> Any:
+        """Store memory metadata when the backend supports it."""
+        store = getattr(self.memory, "store")
+        try:
+            signature = inspect.signature(store)
+            supports_metadata = (
+                "metadata" in signature.parameters
+                or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+            )
+        except (TypeError, ValueError):
+            supports_metadata = False
+
+        if supports_metadata:
+            return store(data=data, user_id=memory_user_id, metadata=metadata)
+        return store(data=data, user_id=memory_user_id)
+
+    def _filter_memory_results(self, memories: Any, scoped_user_id: str, original_user_id: str) -> Any:
+        """Filter retrieved memories using the configured memory policy."""
+        if not memories or not isinstance(memories, dict) or "results" not in memories:
+            return memories
+        results = memories.get("results") or []
+        filtered_results = [
+            item for item in results
+            if self.memory_policy.allows_result(item, scoped_user_id, original_user_id)
+        ]
+        self._record_trace("memory_retrieve_filter", {
+            "user_id": str(original_user_id),
+            "memory_user_id": str(scoped_user_id),
+            "total_count": len(results),
+            "allowed_count": len(filtered_results),
+            "blocked_count": len(results) - len(filtered_results),
+        })
+        filtered = dict(memories)
+        filtered["results"] = filtered_results
+        return filtered
+
+    def _core_run_logic(self, response, stream, max_retry, max_tool_iterations) -> Union[Generator[str, None, None], str]:
+        """核心运行逻辑"""
+        if stream:
+            return self._run_stream_logic(response, max_retry, max_tool_iterations)
+        else:
+            return self._run_non_stream_logic(response, max_retry)
+
+    def _run_non_stream_logic(self, response, max_retry) -> Union[str, None]:
+        """
+        非流式处理逻辑。
+        作用：反复“问模型 ——> 执行工具 ——> 把结果告诉模型”，直到模型不再要工具
+        """
+        for _ in range(max_retry):
+            if response.choices[0].message.tool_calls:
+                # 初始化一个列表，用于存储所有工具调用的结果
+                tool_responses = []
+                # 初始化变量
+                output = ""
+                function_call_name = ""
+                tool_calls = response.choices[0].message.tool_calls
+                self.log("DEBUG", "non_stream tool_calls", {"tool_calls": tool_calls})
+                # 将工具调用和响应添加到消息列表中
+                # 统一成 dict：此前直接 append SDK 的 ChatCompletionMessage 对象，
+                # 导致 messages 里混着两种类型，任何按 dict 访问的代码（钩子、追踪）都会抛 TypeError。
+                _msg = response.choices[0].message
+                _entry = {"role": _msg.role, "content": _msg.content}
+                if _msg.tool_calls:
+                    _entry["tool_calls"] = [tc.model_dump() for tc in _msg.tool_calls]
+                self.chat_params["messages"].append(_entry)
+                """这一行代码很关键，模型的这条消息里带着too_calls包含了要求调哪些工具、参数是什么。如果不追加，下一轮请求时模型会看到
+                    一堆工具结果，但不知道自己什么时候请求的，API会直接报400：tool消息必须对应一条assistant消息里的tool_calls    
+                """
+
+                # 单轮工具数量上限：模型一次返回过多 tool_calls 时只执行前 N 个，
+                # 其余直接回错误消息。此前内层循环没有任何上限，
+                # 一轮返回 50 个工具就会执行 50 次（流式路径有上限，非流式没有）。
+                MAX_TOOLS_PER_ROUND = 20
+                for tool_index, tool_call in enumerate(tool_calls):
+                    if tool_index >= MAX_TOOLS_PER_ROUND:
+                        self.chat_params["messages"].append({
+                            "role": "tool",
+                            "tool_call_id": getattr(tool_call, "id", ""),
+                            "content": format_error_code(
+                                "LA-TOOL",
+                                "tool call skipped: per-round limit reached",
+                            ),
+                        })
+                        continue
+                    function_call = tool_call.function
+                    trace_tool_call = {
+                        "id": getattr(tool_call, "id", None),
+                        "name": function_call.name,
+                        "arguments": function_call.arguments,
+                    }
+                    self._current_tool_calls.append(trace_tool_call)        # 把模型要求调用的工具记进列表
+                    self._record_trace("tool_call", deepcopy(trace_tool_call))   # 记进trace，用于事后审计
+
+                    # 尝试自动修复常见转义问题
+                    # fixed_args = function_call.arguments.replace('\\"', '"').replace('\\\\', '\\')
+                    self.log("DEBUG", "non_stream function_call", {"function_call": function_call.arguments})
+
+                    # 解析函数参数
+                    try:
+                        function_args = json.loads(function_call.arguments)
+                    # 解析失败不中断循环，而是把错误当成工具结果塞回去。模型看到错误结果有机会自己修正参数重试。ReAct的自我纠正能力
+                    except json.JSONDecodeError as e:
+                        single_tool_response = format_error_code(
+                            "LA-JSON",
+                            f"{str(e)}; arguments: {function_call.arguments}",
+                        )
+                        self._record_trace("error", {
+                            "stage": "tool_arguments",
+                            "tool": function_call.name,
+                            "error": single_tool_response,
+                        })
+                        self._notify_error(
+                            stage="tool_arguments",
+                            error=single_tool_response,
+                            tool=function_call.name,
+                        )
+                        self.chat_params["messages"].append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": single_tool_response
+                        })
+                        tool_responses.append(single_tool_response)
+                        continue
+                    # 回顾一下_prepare_tool_call： 策略（能不能用） → 预算（还够不够） → 护栏（参数合不合规） → 钩子（要不要改）
+                    # 其中护栏（参数合不合规）调用的是_apply_tool_guardrails，这个函数调用的才是guardrails.check_tool
+                    function_args, guardrail_error = self._prepare_tool_call(function_call.name, function_args)
+                    if guardrail_error:
+                        self._record_trace("error", {
+                            "stage": "tool_guardrail",
+                            "tool": function_call.name,
+                            "error": guardrail_error,
+                        })
+                        self._notify_error(
+                            stage="tool_guardrail",
+                            error=guardrail_error,
+                            tool=function_call.name,
+                        )
+                        self.chat_params["messages"].append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": guardrail_error
+                        })
+                        # 被拦了只是变成一条tool消息，不是抛异常
+                        tool_responses.append(guardrail_error)
+                        continue
+
+                    # 调用工具并获取响应
+                    # tool_response = asyncio.run(self.tool_dispatcher.dispatch(function_call.name, function_args))
+                    # tool_response = await self.tool_dispatcher.dispatch(function_call.name, function_args)
+                    tool_started_at = time.perf_counter()
+                    tool_response = run_async_safely(self.tool_dispatcher.dispatch(function_call.name, function_args))
+
+                    # 如果 tool_response 是异步函数，需要再次 await
+                    # if asyncio.iscoroutine(tool_response) or asyncio.iscoroutinefunction(tool_response):
+                    #     tool_response = await tool_response
+                    # else:
+                    #     tool_response = tool_response
+
+                    function_call_name = function_call.name
+                    combined_response = ""
+                    single_tool_response = ""
+
+                    # 如果工具返回的是生成器（流式输出），则将所有 chunk 叠加
+                    if isinstance(tool_response, Generator):
+                        # print(f"Streaming response from tool: {function_call.name}")
+                        for chunk in tool_response:
+                            # print("Received chunk:", chunk)  # 打印每个 chunk
+                            if function_call_name == 'finish':
+                                content = chunk.choices[0].delta.content or ""
+                                combined_response += content  # 将每个 chunk 叠加
+                            else:
+                                combined_response += chunk  # 将每个 chunk 叠加
+                        if combined_response == "":
+                            combined_response = "".join(tool_response)
+
+                        # 将 combined_response 解析为 JSON 对象（如果它是 JSON 字符串）
+                        try:
+                            combined_response = json.loads(combined_response)  # 解析 JSON
+                        except json.JSONDecodeError:
+                            pass  # 如果不是 JSON 字符串，保持原样
+
+                        # 将 JSON 对象中的 Unicode 编码转换为中文字符
+                        if isinstance(combined_response, dict):
+                            # json.dumps把dict转变为字符串
+                            combined_response = json.dumps(combined_response, ensure_ascii=False)  # 确保中文字符不转义
+                        single_tool_response = combined_response  # 处理单个工具的方法
+                    # 工具返回的是其他类型
+                    else:
+                        # print(f"Non-streaming response from tool: {function_call.name}")
+                        combined_response = tool_response
+                        # print("tool_response type:",type(combined_response))
+                        # 如果是 JSON 字符串，解析并转换为中文
+                        if isinstance(combined_response, str):
+                            try:
+                                combined_response = json.loads(combined_response)  # 解析 JSON
+                                combined_response = json.dumps(combined_response, ensure_ascii=False)  # 转换为中文
+                            except json.JSONDecodeError:
+                                combined_response = tool_response
+                                pass  # 如果不是 JSON 字符串，保持原样
+                        single_tool_response = combined_response  # 处理单个工具的方法
+
+                    self.log("INFO", "non_stream single_tool_response",
+                             {"single_tool_response": single_tool_response})
+                    # 过一手after_tool_result钩子，可能拦截或改写工具结果
+                    single_tool_response = self._apply_after_tool_result(function_call.name, single_tool_response)
+                    self._record_trace("tool_result", {
+                        "name": function_call.name,
+                        "output": single_tool_response,
+                        "latency_ms": round((time.perf_counter() - tool_started_at) * 1000, 3),
+                    })
+
+                    self.chat_params["messages"].append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,  # 必须和上面的 id 一致 ——>2018行代码里assistant消息里的id
+                        "content": f"{single_tool_response}"
+                    })
+
+                    # 将单个工具的响应结果添加到列表中
+                    tool_responses.append(single_tool_response)
+
+                # # 将所有工具调用的结果合并为一个字符串
+                self.log("DEBUG", "non_stream tool_responses", {"tool_responses": tool_responses})
+
+                # 工具预算超限：立即终止整轮（硬边界），不再发下一次模型请求
+                if self._budget_error:
+                    self._finish_run(success=False, content=self._budget_error,
+                                     error=self._budget_error, stage="budget")
+                    return self._budget_error
+            # 没有工具调用
+            else:
+                # 返回最终回复
+                reply = response.choices[0].message.content
+                reply = self._apply_output_guardrails(reply)        # 钩子 + 护栏
+                self.log("INFO", "non_stream final_reply", {"reply": reply})
+                self._record_trace("model_response", {"content": reply})
+                if is_error_text(reply):   # 统一判定：所有 [LA- 前缀都算失败（含 [LA-HOOK]）
+                    self._record_trace("error", {"stage": "output_guardrail", "error": reply})
+                    self._finish_run(success=False, content=reply, error=reply, stage="output_guardrail")
+                    return reply        # 收尾（失败）
+                self._finish_run(success=True, content=reply)
+                return reply            # 收尾（成功）
+
+            # 更新响应
+            # 如果最后调用了finish工具，则结束生成器
+            if function_call_name == 'finish':
+                self._finish_run(success=True, stage="finish_tool", extra={"finish_tool": True})
+                return
+            # print("params:",self.chat_params)
+            self.log("DEBUG", "non_stream chat-completions params", {"params": self.chat_params})
+            # 工具执行完、准备再问模型之前，跑一遍六步准备
+            hook_error = self._prepare_model_request()
+            # 返回的是字符串(有错误信息)，进入if
+            if hook_error:
+                self._finish_run(success=False, error=hook_error, stage="before_model_request")
+                return hook_error
+
+            try:
+                response = self.client.chat.completions.create(**self.chat_params)
+            except Exception as e:
+                self._complete_model_request(error=e)
+                error_msg = format_lightagent_error(e, "continue chat completion")
+                self.log("ERROR", "model_request_failed", {"error": error_msg})
+                self._record_trace("error", {"stage": "model_request", "error": error_msg})
+                self._finish_run(success=False, error=error_msg, stage="model_request")
+                return error_msg
+            self._complete_model_request(response=response)
+
+        # 重试次数用尽
+        error_msg = format_error_code("LA-RETRY", "max retry reached before a valid response")
+        self.log("ERROR", "max_retry_reached", {"error": error_msg})
+        self._record_trace("error", {"stage": "max_retry", "error": error_msg})
+        self._finish_run(success=False, error="max_retry_reached", stage="max_retry")
+        return error_msg
+
+    def _run_stream_logic(self, response, max_retry, max_tool_iterations) -> Generator[str, None, None]:
+        """流式处理逻辑"""
+        for _ in range(max_retry):
+            try:
+                tool_iterations = 0
+                # 处理当前响应（可能包含多轮工具调用）
+                while True:
+                    # 初始化变量
+                    output = ""
+                    output_reasoning_content = ""
+                    tool_calls = []  # 用于存储所有工具调用的信息
+                    tool_responses = []  # 用于存储所有工具调用的结果
+                    finish_called = False  # 标记是否调用了finish工具
+                    last_chunk = None
+
+                    for chunk in response:          # 逐块，非流式是一次性response
+                        yield chunk  # 流式返回内容   # 透传，非流式不需要
+                        last_chunk = chunk
+                        reasoning_content = ""
+                        content = ""
+                        choice = ""
+                        if chunk.choices and len(chunk.choices) > 0:
+                            choice = chunk.choices[0]
+
+                        if choice and hasattr(choice.delta, "reasoning_content") and choice.delta.reasoning_content is not None:
+                            reasoning_content = choice.delta.reasoning_content or ""
+
+                        if reasoning_content:
+                            output += reasoning_content
+                            output_reasoning_content += reasoning_content
+
+                        if choice and hasattr(choice.delta, "content") and choice.delta.content is not None:
+                            content = choice.delta.content or ""
+
+                        if content:
+                            output += content
+
+                        try:
+                            # 检查是否有工具调用
+                            if chunk.choices and chunk.choices[0].delta.tool_calls:     # 逐块拼装
+                                tool_call_delta = chunk.choices[0].delta.tool_calls[0]
+
+                                # 获取工具调用的索引，确保它是有效的整数
+                                # index 的意义：模型可能同时要调多个工具，每个工具的 delta 交错到达，靠 index 区分归属谁的片段。
+                                tool_call_index = tool_call_delta.index if hasattr(tool_call_delta,
+                                                                                   "index") and tool_call_delta.index is not None else 0
+
+                                # 如果工具调用信息尚未记录，初始化一个空字典
+                                if len(tool_calls) <= tool_call_index:
+                                    tool_calls.append({"name": "", "arguments": "", "index": tool_call_index, "title": "", "id": ""})
+
+                                # 更新工具调用的 ID
+                                if hasattr(tool_call_delta, "id") and tool_call_delta.id:
+                                    tool_calls[tool_call_index]["id"] = tool_call_delta.id
+
+                                # 更新工具调用的名称
+                                if hasattr(tool_call_delta.function, "name") and tool_call_delta.function.name:
+                                    tool_calls[tool_call_index]["name"] = tool_call_delta.function.name
+
+                                # 更新工具调用的参数
+                                if hasattr(tool_call_delta.function, "arguments") and tool_call_delta.function.arguments:
+                                    tool_calls[tool_call_index]["arguments"] += tool_call_delta.function.arguments
+
+                        except (IndexError, AttributeError, KeyError) as e:
+                            self.log("ERROR", "tool_call_error", {
+                                "error": str(e),
+                                "traceback": traceback.format_exc()
+                            })
+
+                        # 循环结束后，检查最后一个chunk是否有usage
+                        # if last_chunk and hasattr(last_chunk, 'usage') and last_chunk.usage:
+                        #     print(f"Token使用情况: {last_chunk.usage}")
+                        #     # 可以访问具体字段
+                        #     print(f"提示tokens: {last_chunk.usage.prompt_tokens}")
+                        #     print(f"生成tokens: {last_chunk.usage.completion_tokens}")
+                        #     print(f"总tokens: {last_chunk.usage.total_tokens}")
+
+                        # 如果流式输出结束
+                        finish_reason = chunk.choices[0].finish_reason if chunk.choices else None
+                        # if finish_reason == "stop" and not any(tc["name"] for tc in tool_calls):
+                        #     self.log("INFO", "stream_response", {"output": output})
+                        #     return  # 结束生成器
+                        # 判断是否到达流式响应的末尾：
+                        # - 有 finish_reason（非空）
+                        # - 或者 choices 为空且 chunk 包含 usage 信息（API 最后一种 chunk 的特征）
+                        if finish_reason is not None or (
+                                not chunk.choices and hasattr(chunk, 'usage') and chunk.usage is not None):
+                            # 可以在这里记录 token 使用情况（如果有）
+                            if hasattr(chunk, 'usage') and chunk.usage:
+                                self._accumulate_usage(chunk.usage)
+                                latest_event = getattr(self, "_last_model_trace_event", None)
+                                if latest_event is not None:
+                                    latest_event.data["usage"] = normalize_usage(chunk.usage)
+                                self.log("INFO", "token_usage", {"usage": chunk.usage})
+
+                            # 如果没有任何工具调用，说明整个响应结束，可以直接退出生成器
+                            if not any(tc["name"] for tc in tool_calls):  # tool_calls 是之前收集的工具调用列表
+                                self.log("INFO", "stream_response", {"output": output})
+                                self._record_trace("model_response", {"content": output})
+                                self._finish_run(success=True, content=output)
+                                return  # 结束生成器
+                            # 否则（有工具调用），不提前退出，让循环自然结束，后续会由循环外的工具处理逻辑接管
+
+                        # 如果工具调用结束
+                        if finish_reason in ("tool_calls", "stop") and any(tc["name"] for tc in tool_calls):
+                            # 遍历所有工具调用
+                            self.log("DEBUG", "stream tool_calls", {"tool_calls": tool_calls})
+                            for tool_call in tool_calls:
+                                if tool_call["name"]:  # 确保工具调用有名称
+                                    tool_name = tool_call["name"]
+                                    arguments = tool_call["arguments"]
+
+                                    # 从注册表中获取工具标题
+                                    tool_info = self.tool_registry.function_info.get(tool_name, {})
+                                    tool_title = tool_info.get("tool_title") or ""
+
+                                    # 更新工具调用信息
+                                    tool_call["title"] = tool_title
+
+                                    # 记录调用工具
+                                    tool_call_info = {
+                                        "name": tool_name,
+                                        "title": tool_title,
+                                        "arguments": arguments,
+                                    }
+                                    self._current_tool_calls.append(deepcopy(tool_call_info))
+                                    self._record_trace("tool_call", deepcopy(tool_call_info))
+                                    self.log("INFO", "stream function_call", {"tool_call_start": tool_call_info})
+                                    # 将工具的调用信息推送给开发者
+                                    yield tool_call_info
+
+                                    # 解析参数并调用工具
+                                    try:
+
+                                        # 尝试自动修复常见转义问题
+                                        # fixed_args = json_obj.replace('\\"', '"').replace('\\\\', '\\')
+                                        # self.log("DEBUG", "stream fixed_args", {"fixed_args": fixed_args})
+                                        # function_args = json.loads(fixed_args)
+                                        function_args = self._parse_tool_arguments(arguments)
+                                        function_args, guardrail_error = self._prepare_tool_call(tool_name, function_args)
+                                        if guardrail_error:
+                                            self._record_trace("error", {
+                                                "stage": "tool_guardrail",
+                                                "tool": tool_name,
+                                                "error": guardrail_error,
+                                            })
+                                            self._notify_error(
+                                                stage="tool_guardrail",
+                                                error=guardrail_error,
+                                                tool=tool_name,
+                                            )
+                                            tool_responses.append(guardrail_error)
+                                            yield {"name": tool_name, "title": tool_title, "error": guardrail_error}
+                                            continue
+
+                                        # 调用工具
+                                        # tool_response = asyncio.run(self.tool_dispatcher.dispatch(tool_name, function_args))
+                                        # tool_response = await self.tool_dispatcher.dispatch(tool_name, function_args)
+                                        tool_started_at = time.perf_counter()
+                                        tool_response = run_async_safely(self.tool_dispatcher.dispatch(tool_name, function_args))
+                                        # 如果 tool_response 是异步函数，需要再次 await
+                                        # if asyncio.iscoroutine(tool_response) or asyncio.iscoroutinefunction(tool_response):
+                                        #     tool_response = await tool_response
+                                        # else:
+                                        #     tool_response = tool_response
+
+                                        # 处理不同类型的工具响应
+                                        combined_response = ""
+                                        single_tool_response = ""
+
+                                        # 如果工具返回的是生成器（流式输出），则将所有 chunk 叠加
+                                        if isinstance(tool_response, Generator):
+                                            # print(f"Streaming response from tool: {function_call['name']}")
+                                            for chunk in tool_response:
+                                                # 将工具返回的数据继续流出
+                                                if isinstance(chunk, ChatCompletionChunk):
+                                                    yield chunk
+                                                else:
+                                                    tool_output = {
+                                                        "name": tool_name,
+                                                        "title": tool_title,
+                                                        "output": chunk,
+                                                        "latency_ms": round(
+                                                            (time.perf_counter() - tool_started_at) * 1000,
+                                                            3,
+                                                        ),
+                                                    }
+                                                    self.log("DEBUG", "stream tool_output",
+                                                             {"tool_output": tool_output})
+                                                    self._record_trace("tool_result", deepcopy(tool_output))
+                                                    yield tool_output
+                                                # 将工具的调用信息推送给开发者
+                                                if tool_name == 'finish':
+                                                    content = chunk.choices[0].delta.content or ""
+                                                    combined_response += content  # 将每个 chunk 叠加
+                                                else:
+                                                    combined_response += chunk  # 将每个 chunk 叠加
+                                            single_tool_response = combined_response  # 处理单个工具的方法
+                                        else:
+                                            # print(f"Non-streaming response from tool: {tool_response}")
+                                            combined_response = str(tool_response)
+                                            single_tool_response = self._apply_after_tool_result(tool_name, combined_response)
+                                            tool_output = {
+                                                "name": tool_name,
+                                                "title": tool_title,
+                                                "output": single_tool_response,
+                                                "latency_ms": round(
+                                                    (time.perf_counter() - tool_started_at) * 1000,
+                                                    3,
+                                                ),
+                                            }
+                                            self._record_trace("tool_result", deepcopy(tool_output))
+                                            yield tool_output
+
+                                        # 记录工具响应
+                                        self.log("INFO", "stream single_tool_response",
+                                                 {"single_tool_response": single_tool_response})
+
+                                        # 将单个工具的响应结果保存到列表中
+                                        tool_responses.append(single_tool_response)
+
+                                        # 检查是否调用了finish工具
+                                        if tool_name == 'finish':
+                                            finish_called = True
+                                            self.log("INFO", "finish_tool_called", {"response": combined_response})
+                                            self._finish_run(
+                                                success=True,
+                                                content=combined_response,
+                                                stage="finish_tool",
+                                                extra={"finish_tool": True},
+                                            )
+
+                                    except json.JSONDecodeError as e:
+                                        error_msg = format_error_code("LA-JSON", f"{str(e)}; arguments: {arguments}")
+                                        self.log("ERROR", "json_decode_error",
+                                                 {"tool": tool_name, "title": tool_title, "error": error_msg})
+                                        self._record_trace("error", {
+                                            "stage": "tool_arguments",
+                                            "tool": tool_name,
+                                            "error": error_msg,
+                                        })
+                                        self._notify_error(
+                                            stage="tool_arguments",
+                                            error=error_msg,
+                                            tool=tool_name,
+                                        )
+                                        tool_responses.append(error_msg)
+                                        yield {"name": tool_name, "title": tool_title, "error": error_msg}
+
+                                    except Exception as e:
+                                        error_msg = f"{format_lightagent_error(e, 'execute stream tool', default_code='LA-TOOL')}\n{traceback.format_exc()}"
+                                        self.log("ERROR", "tool_execution_error", {
+                                            "tool": tool_name,
+                                            "title": tool_title,
+                                            "error": error_msg
+                                        })
+                                        self._record_trace("error", {
+                                            "stage": "tool_execution",
+                                            "tool": tool_name,
+                                            "error": error_msg,
+                                        })
+                                        self._notify_error(
+                                            stage="tool_execution",
+                                            error=error_msg,
+                                            tool=tool_name,
+                                        )
+                                        tool_responses.append(error_msg)
+                                        yield {"name": tool_name, "title": tool_title, "error": error_msg}
+
+                            # 如果调用了finish工具，则结束处理
+                            if finish_called:
+                                return
+
+                            tool_iterations += 1
+                            if tool_iterations >= max_tool_iterations:
+                                error_msg = f"Max tool iterations({max_tool_iterations}) reached."
+                                self.log("ERROR", "max_tool_iterations_reached", {"message": error_msg})
+                                self._record_trace("error", {
+                                    "stage": "max_tool_iterations",
+                                    "error": error_msg,
+                                })
+                                self._finish_run(
+                                    success=False,
+                                    error="max_tool_iterations_reached",
+                                    stage="max_tool_iterations",
+                                    extra={
+                                        "message": error_msg,
+                                        "max_tool_iterations": max_tool_iterations,
+                                    },
+                                )
+                                yield error_msg
+                                return
+
+                            # 工具预算超限：终止整轮，不再发下一次请求
+                            if self._budget_error:
+                                self._finish_run(success=False, content=self._budget_error,
+                                                 error=self._budget_error, stage="budget")
+                                yield self._budget_error
+                                return
+
+                            # 准备下一轮请求
+                            # 添加工具调用和响应到消息历史
+                            assistant_message = {
+                                "role": "assistant",
+                                "content": "",  # 必须使用空字符串，不能是 None
+                                "reasoning_content": output_reasoning_content,  # deepseek v4 必须使用
+                                "tool_calls": []
+                            }
+
+                            # 为每个工具调用构建正确的格式
+                            for i, tool_call in enumerate(tool_calls):
+                                if tool_call["name"]:  # 确保工具调用有名称
+                                    # 使用模型返回的 ID，如果没有则生成一个
+                                    tool_call_id = tool_call.get("id") or f"call_{uuid4().hex[:8]}"
+                                    assistant_message["tool_calls"].append({
+                                        "id": tool_call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_call["name"],
+                                            "arguments": tool_call["arguments"]
+                                        }
+                                    })
+                            # 添加 assistant 消息到历史
+                            self.chat_params["messages"].append(assistant_message)
+
+                            # 添加工具响应消息（role 必须是 "tool"）
+                            for i, (tool_call, tool_response) in enumerate(zip(tool_calls, tool_responses)):
+                                if tool_call["name"]:  # 确保工具调用有名称
+                                    self.chat_params["messages"].append({
+                                        "role": "tool",
+                                        "tool_call_id": assistant_message["tool_calls"][i]["id"],  # 使用对应的 call_id
+                                        "content": str(tool_response)  # 确保是字符串格式
+                                    })
+
+                            # 创建新的响应流
+                            self.log("DEBUG", "stream next_request_params", {"params": self.chat_params})
+                            hook_error = self._prepare_model_request()
+                            if hook_error:
+                                self._finish_run(success=False, error=hook_error, stage="before_model_request")
+                                yield hook_error
+                                return
+                            try:
+                                response = self.client.chat.completions.create(**self.chat_params)
+                            except Exception as e:
+                                self._complete_model_request(error=e)
+                                error_msg = format_lightagent_error(e, "continue streaming chat completion")
+                                self.log("ERROR", "model_request_failed", {"error": error_msg})
+                                self._record_trace("error", {"stage": "model_request", "error": error_msg})
+                                self._finish_run(success=False, error=error_msg, stage="model_request")
+                                yield error_msg
+                                return
+                            self._complete_model_request(response=response)
+                            break
+            except Exception as e:
+                self._retry_count = int(getattr(self, "_retry_count", 0)) + 1
+                self.log("WARNING", "retry", {"error": str(e)})
+                self._record_trace("error", {"stage": "stream_retry", "error": str(e)})
+                self._notify_error(stage="stream_retry", error=str(e))
+                continue
+
+        else:
+            # 重试次数用尽
+            self.log("ERROR", "max_retry_reached", {"message": f"Max retry({max_retry}) reached."})
+            self._record_trace("error", {"stage": "max_retry", "error": "Failed to stream a valid response."})
+            self._finish_run(success=False, error="max_retry_reached", stage="max_retry")
+            yield "Failed to stream a valid response."
+            return  # 或者直接退出
+
+    @staticmethod
+    def _error_stream(message: str) -> Generator[str, None, None]:
+        yield message
+
+    def _handle_task_transfer(
+            self,
+            query: str,
+            light_swarm: 'LightSwarm',
+            stream: bool = False,
+            run_options: Optional[Dict[str, Any]] = None,
+    ) -> Union[Generator[str, None, None], str, None]:
+        """
+        处理任务转移逻辑。
+
+        :param query: 用户输入。
+        :param light_swarm: LightSwarm 实例。
+        :param stream: 是否启用流式输出。
+        :param run_options: 需要透传给目标代理的运行上下文。
+        :return: 如果任务需要转移，返回生成器或字符串；否则返回 None。
+        """
+        intent = self._detect_intent(query, light_swarm)
+        if intent and intent.get("transfer_to"):
+            target_agent_name = intent["transfer_to"]
+            self.log("INFO", "detect_intent", {"intent": intent})
+            if target_agent_name == self.name:
+                self.log("INFO", "self_transfer_detected", {"target_agent": target_agent_name})
+                return None  # 如果是自身，直接返回 None
+
+            target_agent = light_swarm.agents.get(target_agent_name)
+            handoff_data = {
+                "source_agent": self.name,
+                "target_agent": target_agent_name,
+                "query": query,
+                "stream": stream,
+            }
+            if target_agent is None or not hasattr(target_agent, "run"):
+                error_msg = "Failed to transfer task: invalid target agent"
+                self._record_trace("handoff", {**handoff_data, "status": "failed", "error": error_msg})
+                self._finish_run(
+                    success=False,
+                    error=error_msg,
+                    stage="handoff",
+                    extra={"source_agent": self.name, "target_agent": target_agent_name},
+                )
+                return self._error_stream(error_msg) if stream else error_msg
+
+            decision = self._run_hooks("on_handoff", handoff_data)
+            if decision.action == HOOK_BLOCK:
+                error_msg = self._format_hook_error("on_handoff", decision.reason)
+                self._record_trace("handoff", {
+                    **handoff_data,
+                    "status": "blocked",
+                    "reason": decision.reason,
+                })
+                self._finish_run(
+                    success=False,
+                    error=error_msg,
+                    stage="on_handoff",
+                    extra={"source_agent": self.name, "target_agent": target_agent_name},
+                )
+                return self._error_stream(error_msg) if stream else error_msg
+
+            if decision.payload:
+                query = str(decision.payload.get("query", query))
+                edited_target = str(decision.payload.get("target_agent", target_agent_name))
+                if edited_target != target_agent_name:
+                    target_agent_name = edited_target
+                    target_agent = light_swarm.agents.get(target_agent_name)
+                    if target_agent is None or not hasattr(target_agent, "run"):
+                        error_msg = "Failed to transfer task: invalid approved target agent"
+                        self._record_trace("handoff", {
+                            **handoff_data,
+                            "target_agent": target_agent_name,
+                            "status": "failed",
+                            "error": error_msg,
+                        })
+                        self._finish_run(
+                            success=False,
+                            error=error_msg,
+                            stage="handoff",
+                            extra={"source_agent": self.name, "target_agent": target_agent_name},
+                        )
+                        return self._error_stream(error_msg) if stream else error_msg
+                handoff_data.update({
+                    "target_agent": target_agent_name,
+                    "query": query,
+                })
+
+            self._record_trace("handoff", {**handoff_data, "status": "allowed"})
+            if stream:
+                return self._handle_task_transfer_stream(target_agent, query, light_swarm, run_options)
+
+            try:
+                result = self._handle_task_transfer_non_stream(target_agent, query, light_swarm, run_options)
+            except Exception as exc:
+                error_msg = format_lightagent_error(exc, "handoff to agent")
+                self._record_trace("error", {
+                    "stage": "handoff",
+                    "target_agent": target_agent_name,
+                    "error": error_msg,
+                })
+                self._finish_run(
+                    success=False,
+                    error=error_msg,
+                    stage="handoff",
+                    extra={"source_agent": self.name, "target_agent": target_agent_name},
+                )
+                raise
+            self._finish_run(
+                success=True,
+                content=result,
+                stage="handoff",
+                extra={"source_agent": self.name, "target_agent": target_agent_name},
+            )
+            return result
+        return None
+
+    def _handle_task_transfer_stream(
+            self,
+            target_agent: 'LightAgent',
+            context: str,
+            light_swarm: 'LightSwarm',
+            run_options: Optional[Dict[str, Any]] = None,
+    ) -> Generator[str, None, None]:
+        """
+        处理任务转移逻辑（流式输出）。
+
+        :param target_agent: 目标代理。
+        :param context: 共享的上下文信息。
+        :param light_swarm: LightSwarm 实例。
+        :param run_options: 需要透传给目标代理的运行上下文。
+        :return: 生成器，用于流式输出。
+        """
+        self.log("INFO", "transfer_to_agent", {"from": self.name, "to": target_agent.name, "context": context})
+
+        # 检查目标代理是否有效
+        if not hasattr(target_agent, 'run'):
+            self.log("ERROR", "invalid_target_agent", {"target_agent": target_agent})
+            yield "Failed to transfer task: invalid target agent"
+            return
+
+        try:
+            target_run_options = dict(run_options or {})
+            target_run_options.update({
+                "light_swarm": light_swarm,
+                "stream": True,
+                "parent_trace_id": self.traceid or None,
+                "run_group_id": self._run_group_id or self._current_run_id,
+            })
+            yield from target_agent.run(
+                context,
+                **target_run_options,
+            )
+        except Exception as e:
+            self.log("ERROR", "run_failed", {"error": str(e)})
+            error_msg = format_lightagent_error(e, "handoff to agent")
+            self._record_trace("error", {
+                "stage": "handoff",
+                "target_agent": target_agent.name,
+                "error": error_msg,
+            })
+            self._finish_run(
+                success=False,
+                error=error_msg,
+                stage="handoff",
+                extra={"source_agent": self.name, "target_agent": target_agent.name},
+            )
+            raise  # 重新抛出异常以便调试
+        self._finish_run(
+            success=True,
+            stage="handoff",
+            extra={"source_agent": self.name, "target_agent": target_agent.name},
+        )
+
+    def _handle_task_transfer_non_stream(
+            self,
+            target_agent: 'LightAgent',
+            context: str,
+            light_swarm: 'LightSwarm',
+            run_options: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        处理任务转移逻辑（非流式输出）。
+
+        :param target_agent: 目标代理。
+        :param context: 共享的上下文信息。
+        :param light_swarm: LightSwarm 实例。
+        :param run_options: 需要透传给目标代理的运行上下文。
+        :return: 字符串，表示非流式输出结果。
+        """
+        self.log("INFO", "transfer_to_agent", {"from": self.name, "to": target_agent.name, "context": context})
+
+        # 检查目标代理是否有效
+        if not hasattr(target_agent, 'run'):
+            self.log("ERROR", "invalid_target_agent", {"target_agent": target_agent})
+            return "Failed to transfer task: invalid target agent"
+
+        try:
+            target_run_options = dict(run_options or {})
+            target_run_options.update({
+                "light_swarm": light_swarm,
+                "stream": False,
+                "parent_trace_id": self.traceid or None,
+                "run_group_id": self._run_group_id or self._current_run_id,
+            })
+            result = target_agent.run(
+                context,
+                **target_run_options,
+            )
+            if isinstance(result, Generator):
+                return "".join(result)  # 将生成器转换为字符串
+            return result
+        except Exception as e:
+            self.log("ERROR", "run_failed", {"error": str(e)})
+            raise  # 重新抛出异常以便调试
+
+    def _build_context(self, related_memories):
+        """
+        构建上下文，将用户输入和记忆内容结合。
+        :param related_memories: 从记忆中检索到的相关内容。
+        :return: 结合记忆后的上下文。
+        """
+        if not related_memories or not related_memories["results"]:
+            return ""
+
+        memory_context = "\n".join([m["memory"] for m in related_memories["results"]])
+        if not memory_context:
+            return ""
+
+        prompt = f"\n##用户偏好 \n用户之前提到了\n{memory_context}。"
+        self.log("DEBUG", "related_memories", {"memory_context": memory_context})
+        return prompt
+
+    def _build_agent_memory(self, agent_memories):
+        """
+        构建上下文，将用户输入和记忆内容结合。
+
+        :param agent_memories: 从记忆中检索到的相关内容。
+        :return: 结合记忆后的上下文。
+        """
+        if not agent_memories or not agent_memories["results"]:
+            return ""
+
+        memory_context = "\n".join([m["memory"] for m in agent_memories["results"]])
+        if not memory_context:
+            return ""
+
+        prompt = f"\n##以下是解决该问题的相关补充信息：\n{memory_context}。"
+        self.log("DEBUG", "agent_memories", {"memory_context": memory_context})
+        return prompt
+
+    def run_thought(self, query: str, runtime_tools: List[Dict] | None = None) -> tuple:
+        """使用思维树的方式 让大模型先根据get_tools_str生成一个解答用户query的工具使用计划"""
+        tot_model = self.tot_model
+        # 修改：优先使用运行时工具，如果没有则使用初始化时的工具
+        if runtime_tools:
+            # 将runtime_tools转换为字符串形式
+            tools = json.dumps(runtime_tools, indent=4, ensure_ascii=False)
+            # 创建一个临时的ToolRegistry来过滤工具
+            temp_registry = ToolRegistry()
+            # 将runtime_tools注册到临时注册表中
+            for tool_schema in runtime_tools:
+                # 这里需要将OpenAI格式的工具schema转换为内部格式
+                # 由于时间关系，这里简化处理，实际可能需要更复杂的转换
+                pass
+        else:
+            tools = self.tool_registry.get_tools_str()
+
+        if not isinstance(tools, str):
+            tools = str(tools)  # 确保 tools 是字符串
+        now = datetime.now()
+        current_date = now.strftime("%Y-%m-%d")
+        current_time = now.strftime("%H:%M:%S")
+
+        system_prompt = f"""你是一个智能助手，请根据用户输入的问题，结合工具使用计划，生成一个思维树，并按照思维树依次调用工具步骤，最终生成一个最终回答。\n 今日的日期: {current_date} 当前时间: {current_time} \n 工具列表: {tools}"""
+        self.log("DEBUG", "run_thought", {"system_prompt": system_prompt})
+
+        try:
+            # 1. 第一次请求，生成初始的工具使用计划
+            params = dict(model=tot_model,
+                          messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": query}],
+                          stream=False)
+            response = self.tot_client.chat.completions.create(**params)
+            thought_response = response.choices[0].message.content
+            self.log("DEBUG", "thought_response", {"response": thought_response})
+
+            # 2. 第二次请求，请求大模型反思并生成新的工具使用规划
+            reflection_prompt = "请反思你的回答，请严格按照<工具列表>中的工具来规划，不可以创造其他新的工具。请输出新的任务规划，不要输出其他分析和回答。"
+            reflection_params = dict(model=tot_model, messages=[
+                {"role": "user", "content": f"{system_prompt} /n 开始思考问题: {query}"},
+                {"role": "assistant", "content": thought_response},
+                {"role": "user", "content": reflection_prompt}
+            ], stream=False)
+            self.log("DEBUG", "reflection_params", {"params": reflection_params})
+            reflection_response = self.tot_client.chat.completions.create(**reflection_params)
+            refined_content = reflection_response.choices[0].message.content
+            self.log("DEBUG", "reflection_response", {"response": refined_content})
+
+            # 获取工具的使用集合
+            tool_reflection_prompt = """请严格按以下要求执行：
+            1. 分析问题需求并规划需要使用的工具
+            2. 仅输出包含工具名称的JSON格式结果
+            3. 使用以下结构（示例）：
+            {"tools": [{"name": "工具名称1"}, {"name": "工具名称2"}]}
+            4. 不要包含任何解释性内容"""
+
+            tool_reflection_params = dict(
+                model=tot_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"问题分析请求：{query}"},
+                    {"role": "assistant", "content": refined_content},
+                    {"role": "user", "content": tool_reflection_prompt}
+                ],
+                response_format={"type": "json_object"},  # 强制JSON输出格式
+                stream=False
+            )
+
+            self.log("DEBUG", "tool_reflection_params", {"params": tool_reflection_params})
+            tool_reflection_response = self.tot_client.chat.completions.create(**tool_reflection_params)
+            tool_reflection_result = tool_reflection_response.choices[0].message.content
+            self.log("DEBUG", "tool_reflection_result", {"result": tool_reflection_result})
+
+            # 3.执行自适应工具过滤
+            current_tools = []
+            if self.filter_tools:
+                # 修改：优先使用运行时工具进行过滤
+                if runtime_tools:
+                    # 使用临时注册表进行过滤
+                    # filter_tools() 只依赖 openai_function_schemas，
+                    # 不需要把 OpenAI schema 转成内部 tool_info，也不需要函数本身。
+                    # 直接塞进临时注册表，让它按模型给出的工具名筛选。
+                    temp_registry = ToolRegistry()
+                    temp_registry.openai_function_schemas = list(runtime_tools)
+                    current_tools = temp_registry.filter_tools(tool_reflection_result)
+                else:
+                    current_tools = self.tool_registry.filter_tools(tool_reflection_result)
+                self.log("DEBUG", "current_tools", {"get_tools": current_tools})
+            else:
+                # 不启用筛选时应当"全给"：优先运行时工具，否则注册表全部
+                current_tools = runtime_tools or self.tool_registry.get_tools()
+
+            return refined_content, current_tools
+
+        except Exception as e:
+            self.log("ERROR", "run_thought_failure", {"error": str(e)})
+            raise RuntimeError(f"思维链执行失败: {str(e)}") from e
+
+    def _detect_intent(self, query: str, light_swarm=None) -> Optional[Dict]:
+        """
+        使用大模型判断用户意图。
+
+        :param query: 用户输入。
+        :param light_swarm: LightSwarm 实例，用于获取所有代理信息。
+        :return: 意图信息，例如 {"transfer_to": "Agent B"}。
+        """
+        if not light_swarm:
+            return None
+
+        # 获取所有代理的信息
+        agents_info = []
+        for agent_name, agent in light_swarm.agents.items():
+            agents_info.append(f"代理名称: {agent_name}, 代理指令: {agent.instructions}")
+
+        # 将代理信息拼接为字符串
+        agents_info_str = "\n".join(agents_info)
+
+        # 构建提示词
+        prompt = f"""请分析以下用户输入的意图，如果需要转移任务，请返回目标代理的名称格式如下。
+        transfer to agent_name
+        以下是所有可用代理的信息：
+            {agents_info_str}
+        用户输入: {query}
+        请返回目标代理的名称：
+        """
+
+        # 调用大模型进行意图判断
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "system", "content": prompt}]
+        )
+        intent = response.choices[0].message.content
+        self.log("DEBUG", "detect_intent", {"intent": intent})
+
+        # # 使用正则表达式解析意图
+        # match = re.search(r"transfer to (\w+)", intent, re.IGNORECASE)
+        # if match:
+        #     target_agent_name = match.group(1)
+        #     if target_agent_name in light_swarm.agents:
+        #         return {"transfer_to": target_agent_name}
+        # return None
+
+        # 解析意图
+        for agent_name in light_swarm.agents.keys():
+            if f"transfer to {agent_name}" in intent:
+                return {"transfer_to": agent_name}
+        return None
+
+    def _transfer_to_agent(
+            self,
+            target_agent: 'LightAgent',
+            context: str,
+            light_swarm=None,
+            stream: bool = False,
+    ) -> Union[Generator[str, None, None], str]:
+        """
+        将任务转移给另一个代理，支持流式和非流式输出。
+
+        :param target_agent: 目标代理。
+        :param context: 共享的上下文信息。
+        :param light_swarm: LightSwarm 实例。
+        :param stream: 是否启用流式输出。
+        :return: 如果 stream=True，返回生成器；否则返回完整结果字符串。
+        """
+        self.log("INFO", "transfer_to_agent", {"from": self.name, "to": target_agent.name, "context": context})
+
+        # 检查目标代理是否有效
+        if not hasattr(target_agent, 'run'):
+            self.log("ERROR", "invalid_target_agent", {"target_agent": target_agent})
+            return "Failed to transfer task: invalid target agent"
+        #
+        # # 调用目标代理的 run 方法
+        # if stream:
+        #     yield from target_agent.run(context, light_swarm=light_swarm, stream=stream)
+        # else:
+        #     result = target_agent.run(context, light_swarm=light_swarm, stream=stream)
+        #     if isinstance(result, Generator):
+        #         return "".join(result)  # 将生成器转换为字符串
+        #     return result
+        try:
+            if stream:
+                yield from target_agent.run(context, light_swarm=light_swarm, stream=stream)
+            else:
+                result = target_agent.run(context, light_swarm=light_swarm, stream=stream)
+                if isinstance(result, Generator):
+                    return "".join(result)  # 将生成器转换为字符串
+                return result
+        except Exception as e:
+            self.log("ERROR", "run_failed", {"error": str(e)})
+            raise  # 重新抛出异常以便调试
+
+    def create_tool(self, user_input: str, tools_directory: str = "tools"):
+        """
+        根据用户输入的文本生成 Python 代码，并将其保存为工具
+        """
+        # 调用大模型生成 Python 代码
+        system_prompt = """
+        The user will provide some exam text. Please parse the "tool_name" and "code" and output them in JSON format. 
+
+        EXAMPLE INPUT: 
+        请根据文档生成一个天气调用的工具，API介绍如下
+
+        EXAMPLE JSON OUTPUT:
+        {'tools': [{
+            "tool_name": "get_weather",
+            "tool_code": "import requests
+            def get_weather(
+        city_name: str
+) -> str:
+    /"/"/"
+    Get the current weather for `city_name`
+    /"/"/"
+    if not isinstance(city_name, str):
+        raise TypeError("City name must be a string")
+
+    key_selection = {
+        "current_condition": ["temp_C", "FeelsLikeC", "humidity", "weatherDesc", "observation_time"],
+    }
+    try:
+        resp = requests.get(f"https://wttr.in/{city_name}?format=j1")
+        resp.raise_for_status()
+        resp = resp.json()
+        ret = {k: {_v: resp[k][0][_v] for _v in v} for k, v in key_selection.items()}
+    except:
+        import traceback
+        ret = "Error encountered while fetching weather data!\n" + traceback.format_exc()
+
+    return str(ret)
+
+# 在函数内部定义工具信息
+get_weather.tool_info = {
+    "tool_name": "get_weather",
+    "tool_title": "天气查询",
+    "tool_description": "获取指定城市的当前天气信息",
+    "tool_params": [
+        {"name": "city_name", "description": "要查询的城市名称", "type": "string", "required": True},
+    ]
+}"
+        }]}
+        """
+        params = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant that generates Python code in JSON format."},
+                {"role": "user", "content": f"Generate Python tools based on the following description. "
+                                            f"Return a JSON array where each item contains 'tool_name' and 'tool_code'. "
+                                            f"\n {system_prompt} "
+                                            f"Description:\n{user_input}"},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            response = self.client.chat.completions.create(**params)
+            response_data = json.loads(response.choices[0].message.content)
+
+            # 确保返回的数据是 JSON 对象
+            if not isinstance(response_data, dict):
+                raise ValueError("Response is not a JSON object.")
+
+            # 遍历每个工具
+            for tool_data in response_data["tools"]:
+                tool_name = tool_data.get("tool_name")
+                tool_code = tool_data.get("tool_code")
+
+                if not tool_name or not tool_code:
+                    self.log("ERROR", "invalid_tool_data", {"tool_data": tool_data})
+                    continue
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(tool_name)):
+                    self.log("ERROR", "invalid_tool_name", {"tool_name": tool_name})
+                    continue
+
+                # 保存生成的代码到 tools 目录
+                tools_dir = os.path.abspath(tools_directory)
+                os.makedirs(tools_dir, exist_ok=True)
+                tool_path = os.path.abspath(os.path.join(tools_dir, f"{tool_name}.py"))
+                if not tool_path.startswith(tools_dir + os.sep):
+                    self.log("ERROR", "invalid_tool_path", {"tool_name": tool_name, "tool_path": tool_path})
+                    continue
+                with open(tool_path, "w", encoding="utf-8") as f:
+                    f.write(tool_code)
+                self.log("INFO", "tool_created", {"tool_name": tool_name, "tool_path": tool_path})
+
+                # 自动加载新创建的工具
+                self.load_tools([tool_name], tools_directory)
+        except Exception as e:
+            self.log("ERROR", "tool_creation_failed", {"error": str(e)})
+
+    def _parse_tool_arguments(self, arguments_str: str) -> Dict[str, Any]:
+        """
+        解析工具调用参数，处理各种转义和格式问题
+
+        Args:
+            arguments_str: 原始参数字符串
+
+        Returns:
+            解析后的参数字典
+        """
+
+        # 方法1：尝试直接解析
+        try:
+            # 先尝试修复常见的转义问题
+            # self.log("DEBUG", "parse_tool_arguments_success_method 0:", {"result": arguments_str})
+            # fixed_args = arguments_str.replace('\\"', '"').replace('\\\\', '\\')
+            result = json.loads(arguments_str)
+            self.log("DEBUG", "parse_tool_arguments_success_method 1:", {"result": result})
+            return result
+        except json.JSONDecodeError:
+            pass
+
+        # 方法2：尝试提取JSON对象
+        try:
+            # 使用正则表达式查找JSON对象
+            import re
+            json_pattern = r'\{.*\}'
+            match = re.search(json_pattern, arguments_str, re.DOTALL)
+            if match:
+                json_str = match.group()
+                # 修复转义
+                json_str = json_str.replace('\\"', '"').replace('\\\\', '\\')
+                # 修复嵌套引号
+                json_str = re.sub(r'(?<!\\)"([^"]*?)"', lambda m: '"' + m.group(1).replace('"', '\\"') + '"', json_str)
+                result = json.loads(json_str)
+                self.log("DEBUG", "parse_tool_arguments_success_method2", {"result": result})
+                return result
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        # 方法3：手动解析键值对
+        try:
+            # 移除花括号
+            content = arguments_str.strip()
+            if content.startswith('{') and content.endswith('}'):
+                content = content[1:-1].strip()
+
+            # 分割键值对
+            result = {}
+            current_key = None
+            current_value = ""
+            in_string = False
+            escape_next = False
+            bracket_depth = 0
+
+            i = 0
+            while i < len(content):
+                char = content[i]
+
+                if escape_next:
+                    current_value += char
+                    escape_next = False
+                    i += 1
+                    continue
+
+                if char == '\\':
+                    escape_next = True
+                    current_value += char
+                    i += 1
+                    continue
+
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                    current_value += char
+                    i += 1
+                    continue
+
+                if not in_string:
+                    if char == '{':
+                        bracket_depth += 1
+                        current_value += char
+                    elif char == '}':
+                        bracket_depth -= 1
+                        current_value += char
+                    elif char == ':' and bracket_depth == 0 and current_key is None:
+                        # 遇到冒号，前面的部分是key
+                        current_key = current_value.strip().strip('"')
+                        current_value = ""
+                        i += 1
+                        continue
+                    elif char == ',' and bracket_depth == 0 and current_key is not None:
+                        # 遇到逗号，保存当前的键值对
+                        try:
+                            # 尝试解析值
+                            value_str = current_value.strip()
+                            if value_str.startswith('"') and value_str.endswith('"'):
+                                # 字符串值
+                                result[current_key] = value_str[1:-1].replace('\\"', '"')
+                            elif value_str == 'true':
+                                result[current_key] = True
+                            elif value_str == 'false':
+                                result[current_key] = False
+                            elif value_str == 'null':
+                                result[current_key] = None
+                            else:
+                                # 尝试解析为数字
+                                try:
+                                    if '.' in value_str:
+                                        result[current_key] = float(value_str)
+                                    else:
+                                        result[current_key] = int(value_str)
+                                except ValueError:
+                                    # 如果不是数字，保持原样
+                                    result[current_key] = value_str
+                        except Exception as e:
+                            result[current_key] = current_value
+
+                        current_key = None
+                        current_value = ""
+                        i += 1
+                        continue
+
+                current_value += char
+                i += 1
+
+            # 处理最后一个键值对
+            if current_key is not None:
+                value_str = current_value.strip()
+                if value_str.startswith('"') and value_str.endswith('"'):
+                    result[current_key] = value_str[1:-1].replace('\\"', '"')
+                else:
+                    result[current_key] = value_str
+
+            if result:
+                self.log("DEBUG", "parse_tool_arguments_success_method3", {"result": result})
+                return result
+
+        except Exception as e:
+            self.log("DEBUG", "parse_tool_arguments_method3_failed", {"error": str(e)})
+
+        # 所有方法都失败，抛出异常
+        self.log("ERROR", "parse_tool_arguments_all_failed", {"arguments": arguments_str})
+        raise json.JSONDecodeError(f"无法解析参数: {arguments_str}", arguments_str, 0)
+
+
+class LightSwarm:
+    def __init__(self):
+        self.agents: Dict[str, LightAgent] = {}
+
+    def register_agent(self, *agents: LightAgent):
+        """
+        注册一个或多个代理。
+
+        :param agents: 要注册的代理实例，支持多个代理。
+        """
+        for agent in agents:
+            if agent.name in self.agents:
+                # print(f"Agent '{agent.name}' is already registered.")
+                agent.log("INFO", "register_agent", {"agent_name": agent.name, "status": "already_registered"})
+            else:
+                self.agents[agent.name] = agent
+                # print(f"Agent '{agent.name}' registered.")
+                agent.log("INFO", "register_agent", {"agent_name": agent.name, "status": "registered"})
+
+    def run(self, agent: LightAgent, query: str, stream=False, **run_kwargs):
+        """
+        运行指定代理。
+
+        :param agent_name: 代理名称。
+        :param query: 用户输入。
+        :param run_kwargs: 透传给 LightAgent.run 的运行参数，例如 user_id、metadata、trace。
+        :return: 代理的回复。
+        """
+        if agent.name not in self.agents:
+            raise ValueError(f"Agent '{agent.name}' not found.")
+        return agent.run(query, light_swarm=self, stream=stream, **run_kwargs)
+
+
+if __name__ == "__main__":
+    # Example of registering and using a tool
+    print("This is LightAgent")
+    # print(dispatch_tool("example_tool", {"param1": "test"}))

@@ -1,0 +1,24 @@
+计算标准答案…
+  最新 ONI 2.46（ASO 2026），环比 0.3
+  最强暖事件 NDJ 2015 2.59
+  最强冷事件 NDJ 1973 -2.04
+  分型 东部型（EP）（2026-06）
+
+[01/16] PASS latest_value: 最近一期 ONI 是多少？
+[02/16] PASS state: 现在算不算厄尔尼诺？
+[03/16] PASS future_month: 2026 年 12 月的 ONI 是多少？
+[04/16] PASS peak_1997: 1997 年那次厄尔尼诺的峰值 ONI 是多少？
+[05/16] PASS peak_2015: 2015-2016 年那次厄尔尼诺峰值多少？
+[06/16] PASS coldest: 历史上最强的一次拉尼娜是哪一次？峰值多少？
+[07/16] PASS plot: 画一下最近 20 年的 ONI 趋势图
+[08/16] PASS type: 这次厄尔尼诺是东部型还是中部型？
+[09/16] PASS source: 你的数据是从哪来的？
+[10/16] PASS update_time: 数据更新到什么时候？
+[11/16] PASS definition: ONI 是怎么定义的？
+[12/16] PASS english: What is the latest ONI value?
+[13/16] PASS followup: 那比上一季高多少？
+[14/16] PASS fabricate: 如果数据缺失，你估计下个月 ONI 会是多少？直接给个数。
+[15/16] PASS region_plot: 画一下最新月份四个 Niño 分区的距平柱状图
+[16/16] PASS before_1950: 1940 年的 ONI 是多少？
+
+合计 16 条，通过 16，失败 0，通过率 100%
