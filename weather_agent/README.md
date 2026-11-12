@@ -10,7 +10,7 @@ python -m weather_agent.cli "最近一期 ONI 是多少？现在是不是厄尔�
 python -m weather_agent.cli -i                    # 交互模式
 python -m weather_agent.cli --session demo1 -i    # 跨进程保留对话
 python -m weather_agent.council "现在厄尔尼诺到什么程度了？"   # 多 Agent 会商
-python weather_agent/checks/check_stage1.py       # 147 项代码级验收
+python weather_agent/checks/check_stage1.py       # 148 项代码级验收
 python weather_agent/checks/eval_set.py           # 16 条问答级评估（真实调用模型）
 python weather_agent/checks/eval_council.py       # 2 条会商评估（每条约 4 次模型调用）
 python weather_agent/checks/eval_knowledge.py     # 6 条知识问答评估（含跨语言）
@@ -58,7 +58,7 @@ python -m weather_agent.knowledge.build_index      # 构建/更新知识库索�
 | `output/` | 生成的 PNG |
 | `data/` | 会话数据库（`--session` 时生成） |
 | `checks/ci_check.py` | CI 门禁：跑断言并与基线对比 |
-| `checks/check_stage1.py` | 代码级验收（147 项，普通脚本，不用 pytest） |
+| `checks/check_stage1.py` | 代码级验收（148 项，普通脚本，不用 pytest） |
 | `checks/eval_council.py` | 会商评估（结构 / 数值可追溯 / 关键词） |
 | `checks/eval_knowledge.py` | 知识问答评估（引用存在 / 不编造引用 / 关键词 / 拒答） |
 | `checks/eval_tools.py` | 工具调用准确率（20 条标注，BFCL 思路） |
