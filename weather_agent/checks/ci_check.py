@@ -97,6 +97,8 @@ def main(argv: list[str] | None = None) -> int:
         regressions.append(f"断言总数下降：{baseline.get('total')} → {total}（可能误删了检查）")
 
     if regressions:
+        print("[CI] 最近输出（便于定位失败用例）：")
+        print("\n".join(output.splitlines()[-40:]))
         print("[CI] 回归：")
         for item in regressions:
             print(f"  - {item}")
