@@ -798,6 +798,30 @@ def case_p1_fixes() -> None:
     check("数值调换被识别", not swapped.ok and len(swapped.mismatched) >= 1, str(swapped.mismatched))
 
 
+def case_truncation() -> None:
+    """max_tokens 截断必须显式失败，不能把半截答案当成功。"""
+    from types import SimpleNamespace as NS
+    from unittest.mock import patch
+
+    from weather_agent.agent import build_agent
+
+    def fake(content: str, finish_reason: str):
+        return NS(choices=[NS(finish_reason=finish_reason,
+                              message=NS(content=content, tool_calls=None, reasoning_content=None))],
+                  usage=None)
+
+    agent = build_agent()
+    with patch.object(agent.client.chat.completions, "create", return_value=fake("半截答案", "length")):
+        truncated = agent.run("测试截断")
+    check("截断返回 LA-TRUNCATED", str(truncated).startswith("[LA-TRUNCATED]"), str(truncated)[:60])
+    check("截断提示包含 max_tokens", "max_tokens" in str(truncated))
+
+    normal = build_agent()
+    with patch.object(normal.client.chat.completions, "create", return_value=fake("完整答案。", "stop")):
+        ok = normal.run("测试正常结束")
+    check("正常结束不被误判", "完整答案" in str(ok) and not str(ok).startswith("[LA-"), str(ok)[:40])
+
+
 def main() -> int:
     for test in (
         case_parse, case_digit_match, case_year_range, case_extremes,
@@ -807,7 +831,7 @@ def main() -> int:
         case_knowledge, case_vector_store, case_metrics, case_prompt_cache,
         case_council_degradation, case_ledger_cap, case_input_guardrail, case_prediction,
         case_budget_tools, case_web_search, case_budget_hard_stop, case_evidence_safety_net,
-        case_p1_fixes,
+        case_p1_fixes, case_truncation,
     ):
         try:
             test()

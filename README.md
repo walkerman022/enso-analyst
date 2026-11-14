@@ -38,12 +38,12 @@ Not covered: qualitative claims and undefined comparison statements.
 
 | Layer | What it checks | Size |
 |---|---|---|
-| Code-level | ledger binding, compaction, isolation, budget, cache, prediction, web fallback | 148 assertions |
+| Code-level | ledger binding, compaction, isolation, budget, cache, prediction, web fallback | 151 assertions |
 | End-to-end | answer correctness (data / knowledge / council / prediction) | 26 cases |
 | Tool choice | expected tool appears in the call sequence | 20 labels |
 | Stability | same question, three runs, core values agree | 5 questions × 3 |
 
-The 148 offline assertions run in CI (`.github/workflows/weather-agent.yml`) and are compared against
+The 151 offline assertions run in CI (`.github/workflows/weather-agent.yml`) and are compared against
 `weather_agent/checks/baseline.json`; a drop in passing count fails the build.
 
 ```bash

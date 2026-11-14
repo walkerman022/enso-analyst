@@ -103,6 +103,11 @@ ERROR_TAXONOMY = {
         "The agent reached its tool-call round limit without a final answer.",
         "Raise max_retry / max_tool_iterations, or simplify the task so it finishes within the limit.",
     ),
+    "LA-TRUNCATED": LightAgentErrorInfo(
+        "LA-TRUNCATED",
+        "The model output was truncated because it reached the max_tokens limit.",
+        "Raise max_tokens, or narrow the question so the answer fits; never treat a partial answer as complete.",
+    ),
     "LA-GUARDRAIL": LightAgentErrorInfo(
         "LA-GUARDRAIL",
         "A configured guardrail blocked this operation.",

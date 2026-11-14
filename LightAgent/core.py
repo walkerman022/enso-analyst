@@ -825,6 +825,18 @@ class LightAgent:
             return self._format_run_result(error_msg, result_format, traceid, error_msg)
         self._complete_model_request(response=response)
 
+        # 非流式才拿得到 choices；截断要显式失败，不能把半截答案当成功
+        if not stream:
+            try:
+                truncated = response.choices[0].finish_reason == "length"
+            except (AttributeError, IndexError):
+                truncated = False
+            if truncated:
+                error_msg = self._output_truncated_error()
+                self._record_trace("error", {"stage": "output_truncated", "error": error_msg})
+                self._finish_run(success=False, content=error_msg, error=error_msg, stage="output_truncated")
+                return self._format_run_result(error_msg, result_format, traceid, error_msg)
+
         result = self._core_run_logic(response, stream, max_retry, effective_max_tool_iterations)
         if stream:
             if result_format == "event":
@@ -1310,6 +1322,14 @@ class LightAgent:
         }
 
     @staticmethod
+    @staticmethod
+    def _output_truncated_error() -> str:
+        """finish_reason=length：输出被 max_tokens 截断，不能当成完整答案。"""
+        return format_error_code("LA-TRUNCATED", {
+            "reason": "finish_reason=length：输出达到 max_tokens 上限被截断",
+            "action": "调大 max_tokens，或让问题更聚焦；不要把半截内容当完整答案返回",
+        })
+
     def _format_guardrail_error(stage: str, reason: str | None = None) -> str:
         details = {"stage": stage}
         if reason:
@@ -2245,6 +2265,16 @@ class LightAgent:
                 return error_msg
             self._complete_model_request(response=response)
 
+            try:
+                truncated = response.choices[0].finish_reason == "length"
+            except (AttributeError, IndexError):
+                truncated = False
+            if truncated:
+                error_msg = self._output_truncated_error()
+                self._record_trace("error", {"stage": "output_truncated", "error": error_msg})
+                self._finish_run(success=False, content=error_msg, error=error_msg, stage="output_truncated")
+                return error_msg
+
         # 重试次数用尽
         error_msg = format_error_code("LA-RETRY", "max retry reached before a valid response")
         self.log("ERROR", "max_retry_reached", {"error": error_msg})
@@ -2346,6 +2376,19 @@ class LightAgent:
                                 if latest_event is not None:
                                     latest_event.data["usage"] = normalize_usage(chunk.usage)
                                 self.log("INFO", "token_usage", {"usage": chunk.usage})
+
+                            # 截断：流式同样不能当成功，明确报错并结束
+                            if finish_reason == "length":
+                                error_msg = self._output_truncated_error()
+                                self._record_trace("error", {
+                                    "stage": "output_truncated",
+                                    "error": error_msg,
+                                    "partial_chars": len(output),
+                                })
+                                self._finish_run(success=False, content=output, error=error_msg,
+                                                 stage="output_truncated")
+                                yield error_msg
+                                return
 
                             # 如果没有任何工具调用，说明整个响应结束，可以直接退出生成器
                             if not any(tc["name"] for tc in tool_calls):  # tool_calls 是之前收集的工具调用列表
@@ -2606,6 +2649,18 @@ class LightAgent:
                             self._complete_model_request(response=response)
                             break
             except Exception as e:
+                # 已经吐给用户的内容撤不回来：重试会导致重复输出，直接失败更诚实
+                if str(output).strip():
+                    error_msg = format_lightagent_error(e, "stream interrupted after partial output")
+                    self._record_trace("error", {
+                        "stage": "stream_interrupted",
+                        "error": error_msg,
+                        "partial_chars": len(output),
+                    })
+                    self._finish_run(success=False, content=output, error=error_msg,
+                                     stage="stream_interrupted")
+                    yield error_msg
+                    return
                 self._retry_count = int(getattr(self, "_retry_count", 0)) + 1
                 self.log("WARNING", "retry", {"error": str(e)})
                 self._record_trace("error", {"stage": "stream_retry", "error": str(e)})
