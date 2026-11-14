@@ -21,3 +21,5 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Run weather_agent checks
         run: python weather_agent/checks/ci_check.py
+      - name: Retrieval gate (keyword only)
+        run: python -m weather_agent.checks.eval_retrieval --no-vector --gate

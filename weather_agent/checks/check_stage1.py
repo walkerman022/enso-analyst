@@ -822,6 +822,19 @@ def case_truncation() -> None:
     check("正常结束不被误判", "完整答案" in str(ok) and not str(ok).startswith("[LA-"), str(ok)[:40])
 
 
+def case_retrieval_metrics() -> None:
+    """检索指标计算：recall@k、MRR、nDCG@k 的边界行为。"""
+    from weather_agent.checks.eval_retrieval import mrr, ndcg_at_k, recall_at_k
+
+    ranked = ["a", "b", "c", "d"]
+    rel = ["a", "c"]
+    check("recall@4 全召回", recall_at_k(ranked, rel, 4) == 1.0, str(recall_at_k(ranked, rel, 4)))
+    check("recall@2 只算前两名", recall_at_k(ranked, rel, 2) == 0.5, str(recall_at_k(ranked, rel, 2)))
+    check("MRR 取首个命中的倒数排名", mrr(["x", "c", "a"], rel) == 0.5, str(mrr(["x", "c", "a"], rel)))
+    check("nDCG 完美排序为 1", ndcg_at_k(["a", "c", "x", "y"], rel, 4) == 1.0,
+          str(ndcg_at_k(["a", "c", "x", "y"], rel, 4)))
+
+
 def main() -> int:
     for test in (
         case_parse, case_digit_match, case_year_range, case_extremes,
@@ -831,7 +844,7 @@ def main() -> int:
         case_knowledge, case_vector_store, case_metrics, case_prompt_cache,
         case_council_degradation, case_ledger_cap, case_input_guardrail, case_prediction,
         case_budget_tools, case_web_search, case_budget_hard_stop, case_evidence_safety_net,
-        case_p1_fixes, case_truncation,
+        case_p1_fixes, case_truncation, case_retrieval_metrics,
     ):
         try:
             test()

@@ -25,7 +25,7 @@ Not covered: qualitative claims and undefined comparison statements.
 ## Capabilities
 
 - **Monitoring / statistics** — ONI, SOI, Niño 1+2/3/4, extremes, historical events, analogues
-- **Knowledge retrieval** — SQLite + Qdrant hybrid search (Chinese bigram + 1024-d vectors, RRF fusion),
+- **Knowledge retrieval** — Qdrant vector search (1024-d) with Chinese-bigram keyword fallback and high-confidence fill;
   with optional web fallback (Bing HTML) when the local corpus has no hit and `--web` is on
 - **Forecasting** — a trained physics-constrained ENSO model served in a separate Python environment;
   outputs are marked as forecasts, with `issued_from` / `data_through` / `model_id`
@@ -38,18 +38,20 @@ Not covered: qualitative claims and undefined comparison statements.
 
 | Layer | What it checks | Size |
 |---|---|---|
-| Code-level | ledger binding, compaction, isolation, budget, cache, prediction, web fallback | 151 assertions |
+| Code-level | ledger binding, compaction, isolation, budget, cache, prediction, web fallback | 155 assertions |
 | End-to-end | answer correctness (data / knowledge / council / prediction) | 26 cases |
 | Tool choice | expected tool appears in the call sequence | 20 labels |
+| Retrieval | recall@4 / MRR / nDCG@4 on labeled queries, plus out-of-domain false positives | 30 + 10 queries |
 | Stability | same question, three runs, core values agree | 5 questions × 3 |
 
-The 151 offline assertions run in CI (`.github/workflows/weather-agent.yml`) and are compared against
+The 155 offline assertions run in CI (`.github/workflows/weather-agent.yml`) and are compared against
 `weather_agent/checks/baseline.json`; a drop in passing count fails the build.
 
 ```bash
 python weather_agent/checks/ci_check.py          # run and compare with baseline
 python weather_agent/checks/ci_check.py --update # refresh baseline
 python weather_agent/checks/eval_set.py          # end-to-end (requires API key)
+python -m weather_agent.checks.eval_retrieval --gate  # RAG: recall@4 / MRR / nDCG
 ```
 
 ## Quick start
