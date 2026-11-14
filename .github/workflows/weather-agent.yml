@@ -23,3 +23,5 @@ jobs:
         run: python weather_agent/checks/ci_check.py
       - name: Retrieval gate (keyword only)
         run: python -m weather_agent.checks.eval_retrieval --no-vector --gate
+      - name: Faithfulness gate
+        run: python -m weather_agent.checks.eval_faithfulness --gate

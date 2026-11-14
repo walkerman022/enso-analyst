@@ -35,6 +35,8 @@ EVIDENCE_EXEMPT = {
     "plot_enso_trend", "plot_enso_regions",
     "save_preference", "recall_preferences", "forget_preference",
     "list_prediction_models", "list_enso_history",
+    # 检索结果是资料正文，里面的数字可能来自网页片段，不应被当成观测证据
+    "search_knowledge",
 }
 
 

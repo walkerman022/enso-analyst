@@ -38,13 +38,14 @@ Not covered: qualitative claims and undefined comparison statements.
 
 | Layer | What it checks | Size |
 |---|---|---|
-| Code-level | ledger binding, compaction, isolation, budget, cache, prediction, web fallback | 155 assertions |
+| Code-level | ledger binding, compaction, isolation, budget, cache, prediction, web fallback | 159 assertions |
 | End-to-end | answer correctness (data / knowledge / council / prediction) | 26 cases |
 | Tool choice | expected tool appears in the call sequence | 20 labels |
 | Retrieval | recall@4 / MRR / nDCG@4 on labeled queries, plus out-of-domain false positives | 30 + 10 queries |
+| Faithfulness | cited claims supported by the cited chunk | 8 answers / 73 claims |
 | Stability | same question, three runs, core values agree | 5 questions × 3 |
 
-The 155 offline assertions run in CI (`.github/workflows/weather-agent.yml`) and are compared against
+The 159 offline assertions run in CI (`.github/workflows/weather-agent.yml`) and are compared against
 `weather_agent/checks/baseline.json`; a drop in passing count fails the build.
 
 ```bash
@@ -52,6 +53,7 @@ python weather_agent/checks/ci_check.py          # run and compare with baseline
 python weather_agent/checks/ci_check.py --update # refresh baseline
 python weather_agent/checks/eval_set.py          # end-to-end (requires API key)
 python -m weather_agent.checks.eval_retrieval --gate  # RAG: recall@4 / MRR / nDCG
+python -m weather_agent.checks.eval_faithfulness --gate  # generation: cited-claim support
 ```
 
 ## Quick start

@@ -835,6 +835,25 @@ def case_retrieval_metrics() -> None:
           str(ndcg_at_k(["a", "c", "x", "y"], rel, 4)))
 
 
+def case_faithfulness() -> None:
+    """生成忠实度：引用归位、术语支持、无关句判不支持。"""
+    from weather_agent.checks.faithfulness import score_answer, split_claims
+
+    claims = split_claims("厄尔尼诺是海温异常。[kb:def-oni] 这是另一句没有引用的话。")
+    check("引用归位到前一句", any("[kb:def-oni]" in claim for claim in claims), str(claims))
+
+    chunks = {"def-oni": "ONI 是 Niño3.4 区海表温度距平的三个月滑动平均。信风与沃克环流相关。"}
+    idf = {"沃克": 3.0, "环流": 2.8, "信风": 2.5, "滑动": 1.2}
+    good = score_answer("沃克环流和信风共同维持海温格局 [kb:def-oni]。", chunks, idf=idf)
+    check("术语命中判为支持", good["faithfulness"] == 1.0, str(good["faithfulness"]))
+
+    bad = score_answer("板块运动导致地震频发 [kb:def-oni]。", chunks, idf=idf)
+    check("无关句判为不支持", bad["faithfulness"] == 0.0, str(bad["faithfulness"]))
+
+    mixed = score_answer("厄尔尼诺是海温异常 [kb:def-oni]。补充一句没有引用的话。", chunks, idf=idf)
+    check("覆盖率只算引用句", 0 < mixed["citation_coverage"] < 1, str(mixed["citation_coverage"]))
+
+
 def main() -> int:
     for test in (
         case_parse, case_digit_match, case_year_range, case_extremes,
@@ -844,7 +863,7 @@ def main() -> int:
         case_knowledge, case_vector_store, case_metrics, case_prompt_cache,
         case_council_degradation, case_ledger_cap, case_input_guardrail, case_prediction,
         case_budget_tools, case_web_search, case_budget_hard_stop, case_evidence_safety_net,
-        case_p1_fixes, case_truncation, case_retrieval_metrics,
+        case_p1_fixes, case_truncation, case_retrieval_metrics, case_faithfulness,
     ):
         try:
             test()
